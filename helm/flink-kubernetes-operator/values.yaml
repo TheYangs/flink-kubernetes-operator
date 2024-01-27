@@ -29,7 +29,8 @@ image:
   # If image digest is set then it takes precedence and the image tag will be ignored
   # digest: ""
 
-imagePullSecrets: []
+imagePullSecrets:
+- name: docker-registry
 
 # Replicas must be 1 unless operator leader election is configured
 replicas: 1
