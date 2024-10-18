@@ -32,6 +32,7 @@ import org.apache.flink.util.function.SupplierWithException;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /** The utils for test autoscaler. */
@@ -47,12 +48,15 @@ public class TestingAutoscalerUtils {
                 JobStatus.RUNNING,
                 new Configuration(),
                 metricGroup,
-                0,
-                MemorySize.ZERO,
                 getRestClusterClientSupplier());
     }
 
     public static JobAutoScalerContext<JobID> createResourceAwareContext() {
+        return createResourceAwareContext(100., "30 gb");
+    }
+
+    public static JobAutoScalerContext<JobID> createResourceAwareContext(
+            Double cpu, String memSize) {
         JobID jobId = JobID.generate();
         MetricRegistry registry = NoOpMetricRegistry.INSTANCE;
         GenericMetricGroup metricGroup = new GenericMetricGroup(registry, null, "test");
@@ -62,17 +66,15 @@ public class TestingAutoscalerUtils {
                 JobStatus.RUNNING,
                 new Configuration(),
                 metricGroup,
-                0,
-                MemorySize.ZERO,
                 TestingAutoscalerUtils.getRestClusterClientSupplier()) {
             @Override
-            public double getTaskManagerCpu() {
-                return 100;
+            public Optional<Double> getTaskManagerCpu() {
+                return Optional.ofNullable(cpu);
             }
 
             @Override
-            public MemorySize getTaskManagerMemory() {
-                return MemorySize.parse("65536 bytes");
+            public Optional<MemorySize> getTaskManagerMemory() {
+                return Optional.ofNullable(memSize).map(MemorySize::parse);
             }
         };
     }

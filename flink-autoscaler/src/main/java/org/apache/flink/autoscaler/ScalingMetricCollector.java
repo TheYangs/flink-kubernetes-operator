@@ -19,6 +19,7 @@ package org.apache.flink.autoscaler;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.autoscaler.exceptions.NotReadyException;
 import org.apache.flink.autoscaler.metrics.CollectedMetricHistory;
@@ -28,6 +29,7 @@ import org.apache.flink.autoscaler.metrics.MetricNotFoundException;
 import org.apache.flink.autoscaler.metrics.ScalingMetric;
 import org.apache.flink.autoscaler.metrics.ScalingMetrics;
 import org.apache.flink.autoscaler.state.AutoScalerStateStore;
+import org.apache.flink.autoscaler.topology.IOMetrics;
 import org.apache.flink.autoscaler.topology.JobTopology;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
@@ -56,12 +58,14 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -69,6 +73,7 @@ import java.util.stream.Stream;
 import static org.apache.flink.autoscaler.metrics.ScalingHistoryUtils.updateVertexList;
 import static org.apache.flink.autoscaler.utils.AutoScalerUtils.excludeVerticesFromScaling;
 import static org.apache.flink.autoscaler.utils.DateTimeUtils.readable;
+import static org.apache.flink.util.Preconditions.checkState;
 
 /** Metric collector using flink rest api. */
 public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerContext<KEY>> {
@@ -104,17 +109,17 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
 
         var jobDetailsInfo =
                 getJobDetailsInfo(ctx, conf.get(AutoScalerOptions.FLINK_CLIENT_TIMEOUT));
-        var jobUpdateTs = getJobUpdateTs(jobDetailsInfo);
+        var jobRunningTs = getJobRunningTs(jobDetailsInfo);
         // We detect job change compared to our collected metrics by checking against the earliest
         // metric timestamp
-        if (!metricHistory.isEmpty() && jobUpdateTs.isAfter(metricHistory.firstKey())) {
-            LOG.info("Job updated at {}. Clearing metrics.", readable(jobUpdateTs));
+        if (!metricHistory.isEmpty() && jobRunningTs.isAfter(metricHistory.firstKey())) {
+            LOG.info("Job updated at {}. Clearing metrics.", readable(jobRunningTs));
             stateStore.removeCollectedMetrics(ctx);
             cleanup(ctx.getJobKey());
             metricHistory.clear();
         }
         var topology = getJobTopology(ctx, stateStore, jobDetailsInfo);
-        var stableTime = jobUpdateTs.plus(conf.get(AutoScalerOptions.STABILIZATION_INTERVAL));
+        var stableTime = jobRunningTs.plus(conf.get(AutoScalerOptions.STABILIZATION_INTERVAL));
         final boolean isStabilizing = now.isBefore(stableTime);
 
         // Calculate timestamp when the metric windows is full
@@ -147,10 +152,10 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
         if (isStabilizing) {
             LOG.info("Stabilizing until {}", readable(stableTime));
             stateStore.storeCollectedMetrics(ctx, metricHistory);
-            return new CollectedMetricHistory(topology, Collections.emptySortedMap());
+            return new CollectedMetricHistory(topology, Collections.emptySortedMap(), jobRunningTs);
         }
 
-        var collectedMetrics = new CollectedMetricHistory(topology, metricHistory);
+        var collectedMetrics = new CollectedMetricHistory(topology, metricHistory, jobRunningTs);
         if (now.isBefore(windowFullTime)) {
             LOG.info("Metric window not full until {}", readable(windowFullTime));
         } else {
@@ -181,9 +186,12 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
     }
 
     @VisibleForTesting
-    protected Instant getJobUpdateTs(JobDetailsInfo jobDetailsInfo) {
-        return Instant.ofEpochMilli(
-                jobDetailsInfo.getTimestamps().values().stream().max(Long::compare).get());
+    protected Instant getJobRunningTs(JobDetailsInfo jobDetailsInfo) {
+        final Map<JobStatus, Long> timestamps = jobDetailsInfo.getTimestamps();
+
+        final Long runningTs = timestamps.get(JobStatus.RUNNING);
+        checkState(runningTs != null, "Unable to find when the job was switched to RUNNING.");
+        return Instant.ofEpochMilli(runningTs);
     }
 
     protected JobTopology getJobTopology(
@@ -196,7 +204,7 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
 
         Set<JobVertexID> vertexSet = Set.copyOf(t.getVerticesInTopologicalOrder());
         updateVertexList(stateStore, ctx, clock.instant(), vertexSet);
-        updateKafkaSourceMaxParallelisms(ctx, jobDetailsInfo.getJobId(), t);
+        updateKafkaPulsarSourceNumPartitions(ctx, jobDetailsInfo.getJobId(), t);
         excludeVerticesFromScaling(ctx.getConfiguration(), t.getFinishedVertices());
         return t;
     }
@@ -204,7 +212,15 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
     @VisibleForTesting
     @SneakyThrows
     protected JobTopology getJobTopology(JobDetailsInfo jobDetailsInfo) {
-        Map<JobVertexID, Integer> maxParallelismMap =
+        var slotSharingGroupIdMap =
+                jobDetailsInfo.getJobVertexInfos().stream()
+                        .filter(e -> e.getSlotSharingGroupId() != null)
+                        .collect(
+                                Collectors.toMap(
+                                        JobDetailsInfo.JobVertexDetailsInfo::getJobVertexID,
+                                        JobDetailsInfo.JobVertexDetailsInfo
+                                                ::getSlotSharingGroupId));
+        var maxParallelismMap =
                 jobDetailsInfo.getJobVertexInfos().stream()
                         .collect(
                                 Collectors.toMap(
@@ -216,32 +232,59 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
         var rawPlan = jobDetailsInfo.getJsonPlan();
         var json = rawPlan.substring("RawJson{json='".length(), rawPlan.length() - "'}".length());
 
+        var metrics = new HashMap<JobVertexID, IOMetrics>();
+        var finished = new HashSet<JobVertexID>();
+        jobDetailsInfo
+                .getJobVertexInfos()
+                .forEach(
+                        d -> {
+                            if (d.getExecutionState() == ExecutionState.FINISHED) {
+                                finished.add(d.getJobVertexID());
+                            }
+                            metrics.put(
+                                    d.getJobVertexID(), IOMetrics.from(d.getJobVertexMetrics()));
+                        });
+
         return JobTopology.fromJsonPlan(
-                json,
-                maxParallelismMap,
-                jobDetailsInfo.getJobVertexInfos().stream()
-                        .filter(jvdi -> jvdi.getExecutionState() == ExecutionState.FINISHED)
-                        .map(JobDetailsInfo.JobVertexDetailsInfo::getJobVertexID)
-                        .collect(Collectors.toSet()));
+                json, slotSharingGroupIdMap, maxParallelismMap, metrics, finished);
     }
 
-    private void updateKafkaSourceMaxParallelisms(Context ctx, JobID jobId, JobTopology topology)
-            throws Exception {
+    private void updateKafkaPulsarSourceNumPartitions(
+            Context ctx, JobID jobId, JobTopology topology) throws Exception {
         try (var restClient = ctx.getRestClusterClient()) {
-            var partitionRegex = Pattern.compile("^.*\\.partition\\.\\d+\\.currentOffset$");
-            for (Map.Entry<JobVertexID, Set<JobVertexID>> entry : topology.getInputs().entrySet()) {
-                if (entry.getValue().isEmpty()) {
-                    var sourceVertex = entry.getKey();
+            Pattern partitionRegex =
+                    Pattern.compile(
+                            "^.*\\.KafkaSourceReader\\.topic\\.(?<kafkaTopic>.+)\\.partition\\.(?<kafkaId>\\d+)\\.currentOffset$"
+                                    + "|^.*\\.PulsarConsumer\\.(?<pulsarTopic>.+)-partition-(?<pulsarId>\\d+)\\..*\\.numMsgsReceived$");
+            for (var vertexInfo : topology.getVertexInfos().values()) {
+                if (vertexInfo.getInputs().isEmpty()) {
+                    var sourceVertex = vertexInfo.getId();
                     var numPartitions =
                             queryAggregatedMetricNames(restClient, jobId, sourceVertex).stream()
-                                    .filter(partitionRegex.asMatchPredicate())
-                                    .count();
+                                    .map(
+                                            v -> {
+                                                Matcher matcher = partitionRegex.matcher(v);
+                                                if (matcher.matches()) {
+                                                    String kafkaTopic = matcher.group("kafkaTopic");
+                                                    String kafkaId = matcher.group("kafkaId");
+                                                    String pulsarTopic =
+                                                            matcher.group("pulsarTopic");
+                                                    String pulsarId = matcher.group("pulsarId");
+                                                    return kafkaTopic != null
+                                                            ? kafkaTopic + "-" + kafkaId
+                                                            : pulsarTopic + "-" + pulsarId;
+                                                }
+                                                return null;
+                                            })
+                                    .filter(Objects::nonNull)
+                                    .collect(Collectors.toSet())
+                                    .size();
                     if (numPartitions > 0) {
                         LOG.debug(
                                 "Updating source {} max parallelism based on available partitions to {}",
                                 sourceVertex,
                                 numPartitions);
-                        topology.updateMaxParallelism(sourceVertex, (int) numPartitions);
+                        topology.get(sourceVertex).setNumSourcePartitions((int) numPartitions);
                     }
                 }
             }
@@ -284,22 +327,20 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                     }
 
                     ScalingMetrics.computeLoadMetrics(
-                            jobVertexID, vertexFlinkMetrics, vertexScalingMetrics, conf);
+                            jobVertexID,
+                            vertexFlinkMetrics,
+                            vertexScalingMetrics,
+                            jobTopology.get(jobVertexID).getIoMetrics(),
+                            conf);
 
                     var metricHistory =
                             histories.getOrDefault(jobKey, Collections.emptySortedMap());
-                    double lagGrowthRate =
-                            computeLagGrowthRate(
-                                    metricHistory,
-                                    jobVertexID,
-                                    vertexScalingMetrics.get(ScalingMetric.LAG));
 
                     ScalingMetrics.computeDataRateMetrics(
                             jobVertexID,
                             vertexFlinkMetrics,
                             vertexScalingMetrics,
                             jobTopology,
-                            lagGrowthRate,
                             conf,
                             observedTprAvg(
                                     jobVertexID,
@@ -315,14 +356,11 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                             "Vertex scaling metrics for {}: {}", jobVertexID, vertexScalingMetrics);
                 });
 
-        var outputRatios = ScalingMetrics.computeOutputRatios(collectedMetrics, jobTopology);
-        LOG.debug("Output ratios: {}", outputRatios);
-
         var globalMetrics =
-                ScalingMetrics.computeGlobalMetrics(collectedJmMetrics, collectedTmMetrics);
+                ScalingMetrics.computeGlobalMetrics(collectedJmMetrics, collectedTmMetrics, conf);
         LOG.debug("Global metrics: {}", globalMetrics);
 
-        return new CollectedMetrics(out, outputRatios, globalMetrics);
+        return new CollectedMetrics(out, globalMetrics);
     }
 
     private static Supplier<Double> observedTprAvg(
@@ -332,33 +370,6 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
         return () ->
                 ScalingMetricEvaluator.getAverage(
                         ScalingMetric.OBSERVED_TPR, jobVertexID, metricHistory, minObservations);
-    }
-
-    private double computeLagGrowthRate(
-            SortedMap<Instant, CollectedMetrics> metricHistory,
-            JobVertexID jobVertexID,
-            Double currentLag) {
-
-        if (metricHistory.isEmpty()) {
-            return Double.NaN;
-        }
-
-        var lastCollectionTime = metricHistory.lastKey();
-        var lastCollectedMetrics =
-                metricHistory.get(lastCollectionTime).getVertexMetrics().get(jobVertexID);
-
-        if (lastCollectedMetrics == null) {
-            return Double.NaN;
-        }
-
-        var lastLag = lastCollectedMetrics.get(ScalingMetric.LAG);
-
-        if (lastLag == null || currentLag == null) {
-            return Double.NaN;
-        }
-
-        var timeDiff = Duration.between(lastCollectionTime, clock.instant()).toSeconds();
-        return (currentLag - lastLag) / timeDiff;
     }
 
     private Map<JobVertexID, Map<String, FlinkMetric>> queryFilteredMetricNames(
@@ -386,7 +397,7 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                             if (previousMetricNames != null
                                     && previousMetricNames
                                             .keySet()
-                                            .equals(topology.getParallelisms().keySet())) {
+                                            .equals(topology.getVertexInfos().keySet())) {
                                 var newMetricNames = new HashMap<>(previousMetricNames);
                                 var sourceMetricNames =
                                         queryFilteredMetricNames(
@@ -435,6 +446,7 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
         if (topology.isSource(jobVertexID)) {
             requiredMetrics.add(FlinkMetric.BACKPRESSURE_TIME_PER_SEC);
             requiredMetrics.add(FlinkMetric.SOURCE_TASK_NUM_RECORDS_IN_PER_SEC);
+            requiredMetrics.add(FlinkMetric.SOURCE_TASK_NUM_RECORDS_IN);
             // Pending records metric won't be available for some sources.
             // The Kafka source, for instance, lazily initializes this metric on receiving
             // the first record. If this is a fresh topic or no new data has been read since
@@ -447,20 +459,10 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                         jobVertexID);
             }
             pendingRecordsMetric.forEach(m -> filteredMetrics.put(m, FlinkMetric.PENDING_RECORDS));
-            FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT_PER_SEC
+            FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT
                     .findAny(allMetricNames)
                     .ifPresent(
-                            m ->
-                                    filteredMetrics.put(
-                                            m, FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT_PER_SEC));
-        } else {
-            // Not a source so we must have numRecordsInPerSecond
-            requiredMetrics.add(FlinkMetric.NUM_RECORDS_IN_PER_SEC);
-        }
-
-        if (!topology.getOutputs().get(jobVertexID).isEmpty()) {
-            // Not a sink so we must have numRecordsOutPerSecond
-            requiredMetrics.add(FlinkMetric.NUM_RECORDS_OUT_PER_SEC);
+                            m -> filteredMetrics.put(m, FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT));
         }
 
         for (FlinkMetric flinkMetric : requiredMetrics) {

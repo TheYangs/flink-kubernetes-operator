@@ -28,7 +28,6 @@ import org.apache.flink.kubernetes.KubernetesClusterClientFactory;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
-import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.artifact.ArtifactManager;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.Mode;
@@ -41,7 +40,6 @@ import org.apache.flink.kubernetes.operator.utils.StandaloneKubernetesUtils;
 import org.apache.flink.util.concurrent.ExecutorThreadFactory;
 
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
-import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.PodList;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import org.slf4j.Logger;
@@ -81,9 +79,10 @@ public class StandaloneFlinkService extends AbstractFlinkService {
     }
 
     @Override
-    public void cancelJob(FlinkDeployment deployment, UpgradeMode upgradeMode, Configuration conf)
+    public CancelResult cancelJob(
+            FlinkDeployment deployment, SuspendMode suspendMode, Configuration conf)
             throws Exception {
-        cancelJob(deployment, upgradeMode, conf, true);
+        return cancelJob(deployment, suspendMode, conf, true);
     }
 
     @Override
@@ -92,15 +91,6 @@ public class StandaloneFlinkService extends AbstractFlinkService {
                 .pods()
                 .inNamespace(namespace)
                 .withLabels(StandaloneKubernetesUtils.getJobManagerSelectors(clusterId))
-                .list();
-    }
-
-    @Override
-    protected PodList getTmPodList(String namespace, String clusterId) {
-        return kubernetesClient
-                .pods()
-                .inNamespace(namespace)
-                .withLabels(StandaloneKubernetesUtils.getTaskManagerSelectors(clusterId))
                 .list();
     }
 
@@ -144,44 +134,44 @@ public class StandaloneFlinkService extends AbstractFlinkService {
 
     @Override
     protected void deleteClusterInternal(
-            ObjectMeta meta,
+            String namespace,
+            String clusterId,
             Configuration conf,
-            boolean deleteHaData,
             DeletionPropagation deletionPropagation) {
-        final String clusterId = meta.getName();
-        final String namespace = meta.getNamespace();
 
-        LOG.info("Deleting Flink Standalone cluster JM resources");
-        kubernetesClient
-                .apps()
-                .deployments()
-                .inNamespace(namespace)
-                .withName(StandaloneKubernetesUtils.getJobManagerDeploymentName(clusterId))
-                .withPropagationPolicy(deletionPropagation)
-                .delete();
+        var jmDeployment =
+                kubernetesClient
+                        .apps()
+                        .deployments()
+                        .inNamespace(namespace)
+                        .withName(StandaloneKubernetesUtils.getJobManagerDeploymentName(clusterId));
+        var remainingTimeout =
+                deleteDeploymentBlocking(
+                        "JobManager",
+                        jmDeployment,
+                        deletionPropagation,
+                        operatorConfig.getFlinkShutdownClusterTimeout());
 
-        LOG.info("Deleting Flink Standalone cluster TM resources");
-        kubernetesClient
-                .apps()
-                .deployments()
-                .inNamespace(namespace)
-                .withName(StandaloneKubernetesUtils.getTaskManagerDeploymentName(clusterId))
-                .withPropagationPolicy(deletionPropagation)
-                .delete();
-        if (deleteHaData) {
-            deleteHAData(namespace, clusterId, conf);
-        }
+        var tmDeployment =
+                kubernetesClient
+                        .apps()
+                        .deployments()
+                        .inNamespace(namespace)
+                        .withName(
+                                StandaloneKubernetesUtils.getTaskManagerDeploymentName(clusterId));
+        deleteDeploymentBlocking(
+                "TaskManager", tmDeployment, deletionPropagation, remainingTimeout);
     }
 
     @Override
-    public ScalingResult scale(FlinkResourceContext<?> ctx, Configuration deployConfig) {
+    public boolean scale(FlinkResourceContext<?> ctx, Configuration deployConfig) {
         var observeConfig = ctx.getObserveConfig();
         var jobSpec = ctx.getResource().getSpec();
         var meta = ctx.getResource().getMetadata();
         if (observeConfig.get(JobManagerOptions.SCHEDULER_MODE) != SchedulerExecutionMode.REACTIVE
                 && jobSpec != null) {
             LOG.info("Reactive scaling is not enabled");
-            return ScalingResult.CANNOT_SCALE;
+            return false;
         }
 
         var clusterId = meta.getName();
@@ -192,7 +182,7 @@ public class StandaloneFlinkService extends AbstractFlinkService {
 
         if (deployment == null || deployment.get() == null) {
             LOG.warn("TM Deployment ({}) not found", name);
-            return ScalingResult.CANNOT_SCALE;
+            return false;
         }
 
         var actualReplicas = deployment.get().getSpec().getReplicas();
@@ -205,19 +195,12 @@ public class StandaloneFlinkService extends AbstractFlinkService {
                     actualReplicas,
                     desiredReplicas);
             deployment.scale(desiredReplicas);
-            return ScalingResult.SCALING_TRIGGERED;
         } else {
             LOG.info(
                     "Not scaling TM replicas: actual({}) == desired({})",
                     actualReplicas,
                     desiredReplicas);
-            return ScalingResult.ALREADY_SCALED;
         }
-    }
-
-    @Override
-    public boolean scalingCompleted(FlinkResourceContext<?> resourceContext) {
-        // Currently there is no good way of checking whether reactive scaling has completed or not.
         return true;
     }
 }

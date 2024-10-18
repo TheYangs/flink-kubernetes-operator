@@ -17,11 +17,15 @@
 
 package org.apache.flink.autoscaler.state;
 
+import org.apache.flink.autoscaler.DelayedScaleDown;
 import org.apache.flink.autoscaler.JobAutoScalerContext;
 import org.apache.flink.autoscaler.ScalingSummary;
 import org.apache.flink.autoscaler.ScalingTracking;
 import org.apache.flink.autoscaler.metrics.CollectedMetrics;
+import org.apache.flink.autoscaler.tuning.ConfigChanges;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
+
+import javax.annotation.Nonnull;
 
 import java.time.Instant;
 import java.util.HashMap;
@@ -47,13 +51,19 @@ public class InMemoryAutoScalerStateStore<KEY, Context extends JobAutoScalerCont
 
     private final Map<KEY, Map<String, String>> parallelismOverridesStore;
 
+    private final Map<KEY, ConfigChanges> tmConfigOverrides;
+
     private final Map<KEY, ScalingTracking> scalingTrackingStore;
+
+    private final Map<KEY, DelayedScaleDown> delayedScaleDownStore;
 
     public InMemoryAutoScalerStateStore() {
         scalingHistoryStore = new ConcurrentHashMap<>();
         collectedMetricsStore = new ConcurrentHashMap<>();
         parallelismOverridesStore = new ConcurrentHashMap<>();
         scalingTrackingStore = new ConcurrentHashMap<>();
+        tmConfigOverrides = new ConcurrentHashMap<>();
+        delayedScaleDownStore = new ConcurrentHashMap<>();
     }
 
     @Override
@@ -63,6 +73,7 @@ public class InMemoryAutoScalerStateStore<KEY, Context extends JobAutoScalerCont
         scalingHistoryStore.put(jobContext.getJobKey(), scalingHistory);
     }
 
+    @Nonnull
     @Override
     public Map<JobVertexID, SortedMap<Instant, ScalingSummary>> getScalingHistory(
             Context jobContext) {
@@ -92,6 +103,7 @@ public class InMemoryAutoScalerStateStore<KEY, Context extends JobAutoScalerCont
         collectedMetricsStore.put(jobContext.getJobKey(), metrics);
     }
 
+    @Nonnull
     @Override
     public SortedMap<Instant, CollectedMetrics> getCollectedMetrics(Context jobContext) {
         return Optional.ofNullable(collectedMetricsStore.get(jobContext.getJobKey()))
@@ -109,10 +121,28 @@ public class InMemoryAutoScalerStateStore<KEY, Context extends JobAutoScalerCont
         parallelismOverridesStore.put(jobContext.getJobKey(), parallelismOverrides);
     }
 
+    @Nonnull
     @Override
     public Map<String, String> getParallelismOverrides(Context jobContext) {
         return Optional.ofNullable(parallelismOverridesStore.get(jobContext.getJobKey()))
                 .orElse(new HashMap<>());
+    }
+
+    @Override
+    public void storeConfigChanges(Context jobContext, ConfigChanges configChanges) {
+        tmConfigOverrides.put(jobContext.getJobKey(), configChanges);
+    }
+
+    @Nonnull
+    @Override
+    public ConfigChanges getConfigChanges(Context jobContext) {
+        return Optional.ofNullable(tmConfigOverrides.get(jobContext.getJobKey()))
+                .orElse(new ConfigChanges());
+    }
+
+    @Override
+    public void removeConfigChanges(Context jobContext) {
+        tmConfigOverrides.remove(jobContext.getJobKey());
     }
 
     @Override
@@ -121,10 +151,25 @@ public class InMemoryAutoScalerStateStore<KEY, Context extends JobAutoScalerCont
     }
 
     @Override
+    public void storeDelayedScaleDown(Context jobContext, DelayedScaleDown delayedScaleDown) {
+        delayedScaleDownStore.put(jobContext.getJobKey(), delayedScaleDown);
+    }
+
+    @Nonnull
+    @Override
+    public DelayedScaleDown getDelayedScaleDown(Context jobContext) {
+        return Optional.ofNullable(delayedScaleDownStore.get(jobContext.getJobKey()))
+                .orElse(new DelayedScaleDown());
+    }
+
+    @Override
     public void clearAll(Context jobContext) {
         scalingHistoryStore.remove(jobContext.getJobKey());
         parallelismOverridesStore.remove(jobContext.getJobKey());
         collectedMetricsStore.remove(jobContext.getJobKey());
+        tmConfigOverrides.remove(jobContext.getJobKey());
+        scalingTrackingStore.remove(jobContext.getJobKey());
+        delayedScaleDownStore.remove(jobContext.getJobKey());
     }
 
     @Override

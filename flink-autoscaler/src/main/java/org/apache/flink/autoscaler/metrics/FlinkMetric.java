@@ -32,18 +32,22 @@ import java.util.stream.Collectors;
  */
 public enum FlinkMetric {
     BUSY_TIME_PER_SEC(s -> s.equals("busyTimeMsPerSecond")),
-    NUM_RECORDS_IN_PER_SEC(s -> s.equals("numRecordsInPerSecond")),
-    NUM_RECORDS_OUT_PER_SEC(s -> s.equals("numRecordsOutPerSecond")),
-    SOURCE_TASK_NUM_RECORDS_OUT_PER_SEC(
-            s -> s.startsWith("Source__") && s.endsWith(".numRecordsOutPerSecond")),
     SOURCE_TASK_NUM_RECORDS_IN_PER_SEC(
             s -> s.startsWith("Source__") && s.endsWith(".numRecordsInPerSecond")),
+    SOURCE_TASK_NUM_RECORDS_OUT(s -> s.startsWith("Source__") && s.endsWith(".numRecordsOut")),
+    SOURCE_TASK_NUM_RECORDS_OUT_PER_SEC(
+            s -> s.startsWith("Source__") && s.endsWith(".numRecordsOutPerSecond")),
+    SOURCE_TASK_NUM_RECORDS_IN(s -> s.startsWith("Source__") && s.endsWith(".numRecordsIn")),
     PENDING_RECORDS(s -> s.endsWith(".pendingRecords")),
     BACKPRESSURE_TIME_PER_SEC(s -> s.equals("backPressuredTimeMsPerSecond")),
 
-    HEAP_MAX(s -> s.equals("Status.JVM.Memory.Heap.Max")),
-    HEAP_USED(s -> s.equals("Status.JVM.Memory.Heap.Used")),
+    HEAP_MEMORY_MAX(s -> s.equals("Status.JVM.Memory.Heap.Max")),
+    HEAP_MEMORY_USED(s -> s.equals("Status.JVM.Memory.Heap.Used")),
+    MANAGED_MEMORY_USED(s -> s.equals("Status.Flink.Memory.Managed.Used")),
+    METASPACE_MEMORY_USED(s -> s.equals("Status.JVM.Memory.Metaspace.Used")),
+
     TOTAL_GC_TIME_PER_SEC(s -> s.equals("Status.JVM.GarbageCollector.All.TimeMsPerSecond")),
+
     NUM_TASK_SLOTS_TOTAL(s -> s.equals("taskSlotsTotal")),
     NUM_TASK_SLOTS_AVAILABLE(s -> s.equals("taskSlotsAvailable"));
 
@@ -51,10 +55,9 @@ public enum FlinkMetric {
             Map.of(
                     FlinkMetric.BUSY_TIME_PER_SEC, zero(),
                     FlinkMetric.PENDING_RECORDS, zero(),
-                    FlinkMetric.NUM_RECORDS_IN_PER_SEC, zero(),
-                    FlinkMetric.NUM_RECORDS_OUT_PER_SEC, zero(),
                     FlinkMetric.SOURCE_TASK_NUM_RECORDS_IN_PER_SEC, zero(),
-                    FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT_PER_SEC, zero());
+                    FlinkMetric.SOURCE_TASK_NUM_RECORDS_IN, zero(),
+                    FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT, zero());
 
     public final Predicate<String> predicate;
 
@@ -71,6 +74,6 @@ public enum FlinkMetric {
     }
 
     private static AggregatedMetric zero() {
-        return new AggregatedMetric("", 0., 0., 0., 0.);
+        return new AggregatedMetric("", 0., 0., 0., 0., 0.);
     }
 }

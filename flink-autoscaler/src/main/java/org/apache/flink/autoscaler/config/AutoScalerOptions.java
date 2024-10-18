@@ -20,6 +20,7 @@ package org.apache.flink.autoscaler.config;
 import org.apache.flink.autoscaler.metrics.MetricAggregator;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
+import org.apache.flink.configuration.MemorySize;
 
 import java.time.Duration;
 import java.util.List;
@@ -100,15 +101,21 @@ public class AutoScalerOptions {
                     .defaultValue(0.3)
                     .withFallbackKeys(oldOperatorConfigKey("target.utilization.boundary"))
                     .withDescription(
-                            "Target vertex utilization boundary. Scaling won't be performed if the current processing rate is within [target_rate / (target_utilization - boundary), (target_rate / (target_utilization + boundary)]");
+                            "Target vertex utilization boundary. Scaling won't be performed if the processing capacity is within [target_rate / (target_utilization - boundary), (target_rate / (target_utilization + boundary)]");
 
-    public static final ConfigOption<Duration> SCALE_UP_GRACE_PERIOD =
-            autoScalerConfig("scale-up.grace-period")
+    public static final ConfigOption<Duration> SCALE_DOWN_INTERVAL =
+            autoScalerConfig("scale-down.interval")
                     .durationType()
                     .defaultValue(Duration.ofHours(1))
-                    .withFallbackKeys(oldOperatorConfigKey("scale-up.grace-period"))
+                    .withDeprecatedKeys(autoScalerConfigKey("scale-up.grace-period"))
+                    .withFallbackKeys(
+                            oldOperatorConfigKey("scale-up.grace-period"),
+                            oldOperatorConfigKey("scale-down.interval"))
                     .withDescription(
-                            "Duration in which no scale down of a vertex is allowed after it has been scaled up.");
+                            "The delay time for scale down to be executed. If it is greater than 0, the scale down will be delayed. "
+                                    + "Delayed rescale can merge multiple scale downs within `scale-down.interval` into a scale down, thereby reducing the number of rescales. "
+                                    + "Reducing the frequency of job restarts can improve job availability. "
+                                    + "Scale down can be executed directly if it's less than or equal 0.");
 
     public static final ConfigOption<Integer> VERTEX_MIN_PARALLELISM =
             autoScalerConfig("vertex.min-parallelism")
@@ -250,6 +257,39 @@ public class AutoScalerOptions {
                     .withDescription(
                             "Max allowed percentage of heap usage during scaling operations. Autoscaling will be paused if the heap usage exceeds this threshold.");
 
+    public static final ConfigOption<Boolean> MEMORY_TUNING_ENABLED =
+            autoScalerConfig("memory.tuning.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withFallbackKeys(oldOperatorConfigKey("memory.tuning.enabled"))
+                    .withDescription(
+                            "If enabled, the initial amount of memory specified for TaskManagers will be reduced/increased according to the observed needs.");
+
+    public static final ConfigOption<Boolean> MEMORY_SCALING_ENABLED =
+            autoScalerConfig("memory.tuning.scale-down-compensation.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withFallbackKeys(
+                            oldOperatorConfigKey("memory.tuning.scale-down-compensation.enabled"))
+                    .withDescription(
+                            "If this option is enabled and memory tuning is enabled, TaskManager memory will be increased when scaling down. This ensures that after applying memory tuning there is sufficient memory when running with fewer TaskManagers.");
+
+    public static final ConfigOption<Double> MEMORY_TUNING_OVERHEAD =
+            autoScalerConfig("memory.tuning.overhead")
+                    .doubleType()
+                    .defaultValue(0.2)
+                    .withFallbackKeys(oldOperatorConfigKey("memory.tuning.overhead"))
+                    .withDescription(
+                            "Overhead to add to tuning decisions (0-1). This ensures spare capacity and allows the memory to grow beyond the dynamically computed limits, but never beyond the original memory limits.");
+
+    public static final ConfigOption<Boolean> MEMORY_TUNING_MAXIMIZE_MANAGED_MEMORY =
+            autoScalerConfig("memory.tuning.maximize-managed-memory")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withFallbackKeys(oldOperatorConfigKey("memory.tuning.maximize-managed-memory"))
+                    .withDescription(
+                            "If enabled and managed memory is used (e.g. RocksDB turned on), any reduction of heap, network, or metaspace memory will increase the managed memory.");
+
     public static final ConfigOption<Integer> VERTEX_SCALING_HISTORY_COUNT =
             autoScalerConfig("history.max.count")
                     .intType()
@@ -295,4 +335,20 @@ public class AutoScalerOptions {
                     .defaultValue(Duration.ofSeconds(10))
                     .withFallbackKeys(oldOperatorConfigKey("flink.rest-client.timeout"))
                     .withDescription("The timeout for waiting the flink rest client to return.");
+
+    public static final ConfigOption<MemorySize> MEMORY_QUOTA =
+            autoScalerConfig("quota.memory")
+                    .memoryType()
+                    .noDefaultValue()
+                    .withFallbackKeys(oldOperatorConfigKey("quota.memory"))
+                    .withDescription(
+                            "Quota of the memory size. When scaling would go beyond this number the the scaling is not going to happen.");
+
+    public static final ConfigOption<Double> CPU_QUOTA =
+            autoScalerConfig("quota.cpu")
+                    .doubleType()
+                    .noDefaultValue()
+                    .withFallbackKeys(oldOperatorConfigKey("quota.cpu"))
+                    .withDescription(
+                            "Quota of the CPU count. When scaling would go beyond this number the the scaling is not going to happen.");
 }

@@ -22,11 +22,13 @@ import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.autoscaler.event.AutoScalerEventHandler;
 import org.apache.flink.autoscaler.metrics.EvaluatedScalingMetric;
 import org.apache.flink.autoscaler.metrics.ScalingMetric;
+import org.apache.flink.autoscaler.topology.ShipStrategy;
 import org.apache.flink.autoscaler.utils.AutoScalerUtils;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.util.Preconditions;
 
+import lombok.Getter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,20 +36,25 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.Collection;
 import java.util.Map;
+import java.util.Objects;
 import java.util.SortedMap;
 
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.MAX_SCALE_DOWN_FACTOR;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.MAX_SCALE_UP_FACTOR;
-import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALE_UP_GRACE_PERIOD;
+import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALE_DOWN_INTERVAL;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALING_EVENT_INTERVAL;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.TARGET_UTILIZATION;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.VERTEX_MAX_PARALLELISM;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.VERTEX_MIN_PARALLELISM;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.EXPECTED_PROCESSING_RATE;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.MAX_PARALLELISM;
+import static org.apache.flink.autoscaler.metrics.ScalingMetric.NUM_SOURCE_PARTITIONS;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.PARALLELISM;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.TRUE_PROCESSING_RATE;
+import static org.apache.flink.autoscaler.topology.ShipStrategy.HASH;
+import static org.apache.flink.util.Preconditions.checkArgument;
 
 /** Component responsible for computing vertex parallelism based on the scaling metrics. */
 public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
@@ -60,6 +67,14 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
     protected static final String INEFFECTIVE_MESSAGE_FORMAT =
             "Ineffective scaling detected for %s (expected increase: %s, actual increase %s). Blocking of ineffective scaling decisions is %s";
 
+    @VisibleForTesting protected static final String SCALING_LIMITED = "ScalingLimited";
+
+    @VisibleForTesting
+    protected static final String SCALE_LIMITED_MESSAGE_FORMAT =
+            "Scaling limited detected for %s (expected parallelism: %s, actual parallelism %s). "
+                    + "Scaling limited due to numKeyGroupsOrPartitions : %s，"
+                    + "upperBoundForAlignment(maxParallelism or parallelismUpperLimit): %s, parallelismLowerLimit: %s.";
+
     private Clock clock = Clock.system(ZoneId.systemDefault());
 
     private final AutoScalerEventHandler<KEY, Context> autoScalerEventHandler;
@@ -68,12 +83,79 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
         this.autoScalerEventHandler = autoScalerEventHandler;
     }
 
-    public int computeScaleTargetParallelism(
+    /** The parallelism change type of {@link ParallelismChange}. */
+    public enum ParallelismChangeType {
+        NO_CHANGE,
+        REQUIRED_CHANGE,
+        OPTIONAL_CHANGE;
+    }
+
+    /**
+     * The rescaling will be triggered if any vertex's ParallelismChange is required. This means
+     * that if all vertices' ParallelismChange is optional, rescaling will be ignored.
+     */
+    @Getter
+    public static class ParallelismChange {
+
+        private static final ParallelismChange NO_CHANGE =
+                new ParallelismChange(ParallelismChangeType.NO_CHANGE, -1);
+
+        private final ParallelismChangeType changeType;
+        private final int newParallelism;
+
+        private ParallelismChange(ParallelismChangeType changeType, int newParallelism) {
+            this.changeType = changeType;
+            this.newParallelism = newParallelism;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            ParallelismChange that = (ParallelismChange) o;
+            return changeType == that.changeType && newParallelism == that.newParallelism;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(changeType, newParallelism);
+        }
+
+        @Override
+        public String toString() {
+            return "ParallelismChange{"
+                    + "changeType="
+                    + changeType
+                    + ", newParallelism="
+                    + newParallelism
+                    + '}';
+        }
+
+        public static ParallelismChange required(int newParallelism) {
+            return new ParallelismChange(ParallelismChangeType.REQUIRED_CHANGE, newParallelism);
+        }
+
+        public static ParallelismChange optional(int newParallelism) {
+            return new ParallelismChange(ParallelismChangeType.OPTIONAL_CHANGE, newParallelism);
+        }
+
+        public static ParallelismChange noChange() {
+            return NO_CHANGE;
+        }
+    }
+
+    public ParallelismChange computeScaleTargetParallelism(
             Context context,
             JobVertexID vertex,
+            Collection<ShipStrategy> inputShipStrategies,
             Map<ScalingMetric, EvaluatedScalingMetric> evaluatedMetrics,
             SortedMap<Instant, ScalingSummary> history,
-            Duration restartTime) {
+            Duration restartTime,
+            DelayedScaleDown delayedScaleDown) {
         var conf = context.getConfiguration();
         var currentParallelism = (int) evaluatedMetrics.get(PARALLELISM).getCurrent();
         double averageTrueProcessingRate = evaluatedMetrics.get(TRUE_PROCESSING_RATE).getAverage();
@@ -81,7 +163,7 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
             LOG.warn(
                     "True processing rate is not available for {}, cannot compute new parallelism",
                     vertex);
-            return currentParallelism;
+            return ParallelismChange.noChange();
         }
 
         double targetCapacity =
@@ -91,7 +173,7 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
             LOG.warn(
                     "Target data rate is not available for {}, cannot compute new parallelism",
                     vertex);
-            return currentParallelism;
+            return ParallelismChange.noChange();
         }
 
         LOG.debug("Target processing capacity for {} is {}", vertex, targetCapacity);
@@ -120,71 +202,103 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
 
         int newParallelism =
                 scale(
+                        vertex,
                         currentParallelism,
+                        inputShipStrategies,
+                        (int) evaluatedMetrics.get(NUM_SOURCE_PARTITIONS).getCurrent(),
                         (int) evaluatedMetrics.get(MAX_PARALLELISM).getCurrent(),
                         scaleFactor,
                         Math.min(currentParallelism, conf.getInteger(VERTEX_MIN_PARALLELISM)),
-                        Math.max(currentParallelism, conf.getInteger(VERTEX_MAX_PARALLELISM)));
+                        Math.max(currentParallelism, conf.getInteger(VERTEX_MAX_PARALLELISM)),
+                        autoScalerEventHandler,
+                        context);
 
-        if (newParallelism == currentParallelism
-                || blockScalingBasedOnPastActions(
-                        context,
-                        vertex,
-                        conf,
-                        evaluatedMetrics,
-                        history,
-                        currentParallelism,
-                        newParallelism)) {
-            return currentParallelism;
+        if (newParallelism == currentParallelism) {
+            // Clear delayed scale down request if the new parallelism is equal to
+            // currentParallelism.
+            delayedScaleDown.clearVertex(vertex);
+            return ParallelismChange.noChange();
         }
 
         // We record our expectations for this scaling operation
         evaluatedMetrics.put(
                 ScalingMetric.EXPECTED_PROCESSING_RATE,
                 EvaluatedScalingMetric.of(cappedTargetCapacity));
-        return newParallelism;
+
+        return detectBlockScaling(
+                context,
+                vertex,
+                conf,
+                evaluatedMetrics,
+                history,
+                currentParallelism,
+                newParallelism,
+                delayedScaleDown);
     }
 
-    private boolean blockScalingBasedOnPastActions(
+    private ParallelismChange detectBlockScaling(
             Context context,
             JobVertexID vertex,
             Configuration conf,
             Map<ScalingMetric, EvaluatedScalingMetric> evaluatedMetrics,
             SortedMap<Instant, ScalingSummary> history,
             int currentParallelism,
-            int newParallelism) {
+            int newParallelism,
+            DelayedScaleDown delayedScaleDown) {
+        checkArgument(
+                currentParallelism != newParallelism,
+                "The newParallelism is equal to currentParallelism, no scaling is needed. This is probably a bug.");
 
-        // If we don't have past scaling actions for this vertex, there is nothing to do
-        if (history.isEmpty()) {
-            return false;
-        }
+        var scaledUp = currentParallelism < newParallelism;
 
-        boolean scaledUp = currentParallelism < newParallelism;
-        var lastScalingTs = history.lastKey();
-        var lastSummary = history.get(lastScalingTs);
+        if (scaledUp) {
+            // Clear delayed scale down request if the new parallelism is greater than
+            // currentParallelism.
+            delayedScaleDown.clearVertex(vertex);
 
-        if (currentParallelism == lastSummary.getNewParallelism() && lastSummary.isScaledUp()) {
-            if (scaledUp) {
-                return detectIneffectiveScaleUp(
-                        context, vertex, conf, evaluatedMetrics, lastSummary);
-            } else {
-                return detectImmediateScaleDownAfterScaleUp(vertex, conf, lastScalingTs);
+            // If we don't have past scaling actions for this vertex, don't block scale up.
+            if (history.isEmpty()) {
+                return ParallelismChange.required(newParallelism);
             }
+
+            var lastSummary = history.get(history.lastKey());
+            if (currentParallelism == lastSummary.getNewParallelism()
+                    && lastSummary.isScaledUp()
+                    && detectIneffectiveScaleUp(
+                            context, vertex, conf, evaluatedMetrics, lastSummary)) {
+                // Block scale up when last rescale is ineffective.
+                return ParallelismChange.noChange();
+            }
+
+            return ParallelismChange.required(newParallelism);
+        } else {
+            return applyScaleDownInterval(delayedScaleDown, vertex, conf, newParallelism);
         }
-        return false;
     }
 
-    private boolean detectImmediateScaleDownAfterScaleUp(
-            JobVertexID vertex, Configuration conf, Instant lastScalingTs) {
+    private ParallelismChange applyScaleDownInterval(
+            DelayedScaleDown delayedScaleDown,
+            JobVertexID vertex,
+            Configuration conf,
+            int newParallelism) {
+        var scaleDownInterval = conf.get(SCALE_DOWN_INTERVAL);
+        if (scaleDownInterval.toMillis() <= 0) {
+            // The scale down interval is disable, so don't block scaling.
+            return ParallelismChange.required(newParallelism);
+        }
 
-        var gracePeriod = conf.get(SCALE_UP_GRACE_PERIOD);
-        if (lastScalingTs.plus(gracePeriod).isAfter(clock.instant())) {
-            LOG.info(
-                    "Skipping immediate scale down after scale up within grace period for {}",
-                    vertex);
-            return true;
+        var firstTriggerTime = delayedScaleDown.getFirstTriggerTimeForVertex(vertex);
+        if (firstTriggerTime.isEmpty()) {
+            LOG.info("The scale down of {} is delayed by {}.", vertex, scaleDownInterval);
+            delayedScaleDown.updateTriggerTime(vertex, clock.instant());
+            return ParallelismChange.optional(newParallelism);
+        }
+
+        if (clock.instant().isBefore(firstTriggerTime.get().plus(scaleDownInterval))) {
+            LOG.debug("Try to skip immediate scale down within scale-down interval for {}", vertex);
+            return ParallelismChange.optional(newParallelism);
         } else {
-            return false;
+            return ParallelismChange.required(newParallelism);
         }
     }
 
@@ -230,66 +344,121 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
                 AutoScalerEventHandler.Type.Normal,
                 INEFFECTIVE_SCALING,
                 message,
-                null,
+                "ineffective" + vertex + expectedIncrease,
                 conf.get(SCALING_EVENT_INTERVAL));
 
-        if (blockIneffectiveScalings) {
-            LOG.warn(
-                    "Ineffective scaling detected for {}, expected increase {}, actual {}",
-                    vertex,
-                    expectedIncrease,
-                    actualIncrease);
-            return true;
-        } else {
-            return false;
-        }
+        return blockIneffectiveScalings;
     }
 
+    /**
+     * Computing the newParallelism. In general, newParallelism = currentParallelism * scaleFactor.
+     * But we limit newParallelism between parallelismLowerLimit and min(parallelismUpperLimit,
+     * maxParallelism).
+     *
+     * <p>Also, in order to ensure the data is evenly spread across subtasks, we try to adjust the
+     * parallelism for source and keyed vertex such that it divides the maxParallelism without a
+     * remainder.
+     *
+     * <p>This method also attempts to adjust the parallelism to ensure it aligns well with the
+     * number of source partitions if a vertex has a known source partition count.
+     */
     @VisibleForTesting
-    protected static int scale(
-            int parallelism,
-            int numKeyGroups,
+    protected static <KEY, Context extends JobAutoScalerContext<KEY>> int scale(
+            JobVertexID vertex,
+            int currentParallelism,
+            Collection<ShipStrategy> inputShipStrategies,
+            int numSourcePartitions,
+            int maxParallelism,
             double scaleFactor,
-            int minParallelism,
-            int maxParallelism) {
-        Preconditions.checkArgument(
-                minParallelism <= maxParallelism,
-                "The minimum parallelism must not be greater than the maximum parallelism.");
-        if (minParallelism > numKeyGroups) {
+            int parallelismLowerLimit,
+            int parallelismUpperLimit,
+            AutoScalerEventHandler<KEY, Context> eventHandler,
+            Context context) {
+        checkArgument(
+                parallelismLowerLimit <= parallelismUpperLimit,
+                "The parallelism lower limitation must not be greater than the parallelism upper limitation.");
+        if (parallelismLowerLimit > maxParallelism) {
             LOG.warn(
                     "Specified autoscaler minimum parallelism {} is greater than the operator max parallelism {}. The min parallelism will be set to the operator max parallelism.",
-                    minParallelism,
-                    numKeyGroups);
+                    parallelismLowerLimit,
+                    maxParallelism);
         }
-        if (numKeyGroups < maxParallelism && maxParallelism != Integer.MAX_VALUE) {
+        if (maxParallelism < parallelismUpperLimit && parallelismUpperLimit != Integer.MAX_VALUE) {
             LOG.debug(
                     "Specified autoscaler maximum parallelism {} is greater than the operator max parallelism {}. This means the operator max parallelism can never be reached.",
-                    maxParallelism,
-                    numKeyGroups);
+                    parallelismUpperLimit,
+                    maxParallelism);
         }
 
         int newParallelism =
                 // Prevent integer overflow when converting from double to integer.
                 // We do not have to detect underflow because doubles cannot
                 // underflow.
-                (int) Math.min(Math.ceil(scaleFactor * parallelism), Integer.MAX_VALUE);
+                (int) Math.min(Math.ceil(scaleFactor * currentParallelism), Integer.MAX_VALUE);
 
-        // Cap parallelism at either number of key groups or parallelism limit
-        final int upperBound = Math.min(numKeyGroups, maxParallelism);
+        // Cap parallelism at either maxParallelism(number of key groups or source partitions) or
+        // parallelism upper limit
+        final int upperBound = Math.min(maxParallelism, parallelismUpperLimit);
 
         // Apply min/max parallelism
-        newParallelism = Math.min(Math.max(minParallelism, newParallelism), upperBound);
+        newParallelism = Math.min(Math.max(parallelismLowerLimit, newParallelism), upperBound);
 
-        // Try to adjust the parallelism such that it divides the number of key groups without a
-        // remainder => state is evenly spread across subtasks
-        for (int p = newParallelism; p <= numKeyGroups / 2 && p <= upperBound; p++) {
-            if (numKeyGroups % p == 0) {
+        var adjustByMaxParallelismOrPartitions =
+                numSourcePartitions > 0 || inputShipStrategies.contains(HASH);
+        if (!adjustByMaxParallelismOrPartitions) {
+            return newParallelism;
+        }
+
+        var numKeyGroupsOrPartitions =
+                numSourcePartitions <= 0 ? maxParallelism : numSourcePartitions;
+        var upperBoundForAlignment =
+                Math.min(
+                        // Optimize the case where newParallelism <= maxParallelism / 2
+                        newParallelism > numKeyGroupsOrPartitions / 2
+                                ? numKeyGroupsOrPartitions
+                                : numKeyGroupsOrPartitions / 2,
+                        upperBound);
+
+        // When the shuffle type of vertex inputs contains keyBy or vertex is a source,
+        // we try to adjust the parallelism such that it divides
+        // the numKeyGroupsOrPartitions without a remainder => data is evenly spread across subtasks
+        for (int p = newParallelism; p <= upperBoundForAlignment; p++) {
+            if (numKeyGroupsOrPartitions % p == 0) {
                 return p;
             }
         }
 
-        // If key group adjustment fails, use originally computed parallelism
-        return newParallelism;
+        // When adjust the parallelism after rounding up cannot be evenly divided by
+        // numKeyGroupsOrPartitions, Try to find the smallest parallelism that can satisfy the
+        // current consumption rate.
+        int p = newParallelism;
+        for (; p > 0; p--) {
+            if (numKeyGroupsOrPartitions / p > numKeyGroupsOrPartitions / newParallelism) {
+                if (numKeyGroupsOrPartitions % p != 0) {
+                    p++;
+                }
+                break;
+            }
+        }
+
+        p = Math.max(p, parallelismLowerLimit);
+        var message =
+                String.format(
+                        SCALE_LIMITED_MESSAGE_FORMAT,
+                        vertex,
+                        newParallelism,
+                        p,
+                        numKeyGroupsOrPartitions,
+                        upperBound,
+                        parallelismLowerLimit);
+        eventHandler.handleEvent(
+                context,
+                AutoScalerEventHandler.Type.Warning,
+                SCALING_LIMITED,
+                message,
+                SCALING_LIMITED + vertex + (scaleFactor * currentParallelism),
+                context.getConfiguration().get(SCALING_EVENT_INTERVAL));
+        return p;
     }
 
     @VisibleForTesting

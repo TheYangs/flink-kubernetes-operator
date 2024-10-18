@@ -19,23 +19,27 @@ package org.apache.flink.autoscaler.jdbc.state;
 
 import org.apache.flink.annotation.Experimental;
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.autoscaler.DelayedScaleDown;
 import org.apache.flink.autoscaler.JobAutoScalerContext;
 import org.apache.flink.autoscaler.ScalingSummary;
 import org.apache.flink.autoscaler.ScalingTracking;
 import org.apache.flink.autoscaler.metrics.CollectedMetrics;
 import org.apache.flink.autoscaler.state.AutoScalerStateStore;
+import org.apache.flink.autoscaler.tuning.ConfigChanges;
 import org.apache.flink.autoscaler.utils.AutoScalerSerDeModule;
 import org.apache.flink.configuration.ConfigurationUtils;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
-import com.fasterxml.jackson.core.JacksonException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JacksonException;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.type.TypeReference;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 import java.time.Instant;
 import java.util.HashMap;
@@ -45,6 +49,8 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 
 import static org.apache.flink.autoscaler.jdbc.state.StateType.COLLECTED_METRICS;
+import static org.apache.flink.autoscaler.jdbc.state.StateType.CONFIG_OVERRIDES;
+import static org.apache.flink.autoscaler.jdbc.state.StateType.DELAYED_SCALE_DOWN;
 import static org.apache.flink.autoscaler.jdbc.state.StateType.PARALLELISM_OVERRIDES;
 import static org.apache.flink.autoscaler.jdbc.state.StateType.SCALING_HISTORY;
 import static org.apache.flink.autoscaler.jdbc.state.StateType.SCALING_TRACKING;
@@ -189,6 +195,57 @@ public class JdbcAutoScalerStateStore<KEY, Context extends JobAutoScalerContext<
     }
 
     @Override
+    public void storeConfigChanges(Context jobContext, ConfigChanges configChanges) {
+        jdbcStateStore.putSerializedState(
+                getSerializeKey(jobContext),
+                CONFIG_OVERRIDES,
+                serializeConfigOverrides(configChanges));
+    }
+
+    @Nonnull
+    @Override
+    public ConfigChanges getConfigChanges(Context jobContext) {
+        return jdbcStateStore
+                .getSerializedState(getSerializeKey(jobContext), CONFIG_OVERRIDES)
+                .map(JdbcAutoScalerStateStore::deserializeConfigOverrides)
+                .orElse(new ConfigChanges());
+    }
+
+    @Override
+    public void removeConfigChanges(Context jobContext) {
+        jdbcStateStore.removeSerializedState(getSerializeKey(jobContext), CONFIG_OVERRIDES);
+    }
+
+    @Override
+    public void storeDelayedScaleDown(Context jobContext, DelayedScaleDown delayedScaleDown)
+            throws Exception {
+        jdbcStateStore.putSerializedState(
+                getSerializeKey(jobContext),
+                DELAYED_SCALE_DOWN,
+                serializeDelayedScaleDown(delayedScaleDown));
+    }
+
+    @Nonnull
+    @Override
+    public DelayedScaleDown getDelayedScaleDown(Context jobContext) {
+        Optional<String> delayedScaleDown =
+                jdbcStateStore.getSerializedState(getSerializeKey(jobContext), DELAYED_SCALE_DOWN);
+        if (delayedScaleDown.isEmpty()) {
+            return new DelayedScaleDown();
+        }
+
+        try {
+            return deserializeDelayedScaleDown(delayedScaleDown.get());
+        } catch (JacksonException e) {
+            LOG.error(
+                    "Could not deserialize delayed scale down, possibly the format changed. Discarding...",
+                    e);
+            jdbcStateStore.removeSerializedState(getSerializeKey(jobContext), DELAYED_SCALE_DOWN);
+            return new DelayedScaleDown();
+        }
+    }
+
+    @Override
     public void clearAll(Context jobContext) {
         jdbcStateStore.clearAll(getSerializeKey(jobContext));
     }
@@ -249,5 +306,37 @@ public class JdbcAutoScalerStateStore<KEY, Context extends JobAutoScalerContext<
 
     private static Map<String, String> deserializeParallelismOverrides(String overrides) {
         return ConfigurationUtils.convertValue(overrides, Map.class);
+    }
+
+    @Nullable
+    private static String serializeConfigOverrides(ConfigChanges configChanges) {
+        try {
+            return YAML_MAPPER.writeValueAsString(configChanges);
+        } catch (Exception e) {
+            LOG.error("Failed to serialize ConfigOverrides", e);
+            return null;
+        }
+    }
+
+    @Nullable
+    private static ConfigChanges deserializeConfigOverrides(String configOverrides) {
+        try {
+            return YAML_MAPPER.readValue(configOverrides, new TypeReference<>() {});
+        } catch (Exception e) {
+            LOG.error("Failed to deserialize ConfigOverrides", e);
+            return null;
+        }
+    }
+
+    private static String serializeDelayedScaleDown(DelayedScaleDown delayedScaleDown)
+            throws JacksonException {
+        return YAML_MAPPER.writeValueAsString(delayedScaleDown.getFirstTriggerTime());
+    }
+
+    private static DelayedScaleDown deserializeDelayedScaleDown(String delayedScaleDown)
+            throws JacksonException {
+        Map<JobVertexID, Instant> firstTriggerTime =
+                YAML_MAPPER.readValue(delayedScaleDown, new TypeReference<>() {});
+        return new DelayedScaleDown(firstTriggerTime);
     }
 }

@@ -25,26 +25,23 @@ import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkSessionJobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
-import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
-import org.apache.flink.kubernetes.operator.api.status.CheckpointInfo;
 import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.Savepoint;
-import org.apache.flink.kubernetes.operator.api.status.SavepointInfo;
-import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.observer.CheckpointFetchResult;
+import org.apache.flink.kubernetes.operator.observer.CheckpointStatsResult;
 import org.apache.flink.kubernetes.operator.observer.SavepointFetchResult;
 import org.apache.flink.runtime.client.JobStatusMessage;
 import org.apache.flink.runtime.jobmaster.JobResult;
-import org.apache.flink.runtime.rest.messages.job.JobDetailsInfo;
 
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.PodList;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
 
 import javax.annotation.Nullable;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -59,6 +56,8 @@ public interface FlinkService {
 
     boolean isHaMetadataAvailable(Configuration conf);
 
+    boolean atLeastOneCheckpoint(Configuration conf);
+
     void submitSessionCluster(Configuration conf) throws Exception;
 
     JobID submitJobToSessionCluster(
@@ -71,11 +70,11 @@ public interface FlinkService {
 
     boolean isJobManagerPortReady(Configuration config);
 
-    Collection<JobStatusMessage> listJobs(Configuration conf) throws Exception;
+    Optional<JobStatusMessage> getJobStatus(Configuration conf, JobID jobId) throws Exception;
 
     JobResult requestJobResult(Configuration conf, JobID jobID) throws Exception;
 
-    void cancelJob(FlinkDeployment deployment, UpgradeMode upgradeMode, Configuration conf)
+    CancelResult cancelJob(FlinkDeployment deployment, SuspendMode suspendMode, Configuration conf)
             throws Exception;
 
     void deleteClusterDeployment(
@@ -84,28 +83,30 @@ public interface FlinkService {
             Configuration conf,
             boolean deleteHaData);
 
-    void cancelSessionJob(FlinkSessionJob sessionJob, UpgradeMode upgradeMode, Configuration conf)
+    CancelResult cancelSessionJob(
+            FlinkSessionJob sessionJob, SuspendMode suspendMode, Configuration conf)
             throws Exception;
 
-    void triggerSavepoint(
+    String triggerSavepoint(
             String jobId,
-            SnapshotTriggerType triggerType,
-            SavepointInfo savepointInfo,
+            org.apache.flink.core.execution.SavepointFormatType savepointFormatType,
+            String savepointDirectory,
             Configuration conf)
             throws Exception;
 
-    void triggerCheckpoint(
+    String triggerCheckpoint(
             String jobId,
-            SnapshotTriggerType triggerType,
-            CheckpointInfo checkpointInfo,
+            org.apache.flink.core.execution.CheckpointType checkpointType,
             Configuration conf)
             throws Exception;
 
-    Optional<Savepoint> getLastCheckpoint(JobID jobId, Configuration conf) throws Exception;
+    Optional<Savepoint> getLastCheckpoint(JobID jobId, Configuration conf);
 
     SavepointFetchResult fetchSavepointInfo(String triggerId, String jobId, Configuration conf);
 
     CheckpointFetchResult fetchCheckpointInfo(String triggerId, String jobId, Configuration conf);
+
+    CheckpointStatsResult fetchCheckpointStats(String jobId, Long checkpointId, Configuration conf);
 
     Tuple2<
                     Optional<CheckpointHistoryWrapper.CompletedCheckpointInfo>,
@@ -118,27 +119,30 @@ public interface FlinkService {
 
     PodList getJmPodList(FlinkDeployment deployment, Configuration conf);
 
-    void waitForClusterShutdown(Configuration conf);
-
-    ScalingResult scale(FlinkResourceContext<?> resourceContext, Configuration deployConfig)
+    boolean scale(FlinkResourceContext<?> resourceContext, Configuration deployConfig)
             throws Exception;
-
-    boolean scalingCompleted(FlinkResourceContext<?> resourceContext);
 
     Map<String, String> getMetrics(Configuration conf, String jobId, List<String> metricNames)
             throws Exception;
 
     RestClusterClient<String> getClusterClient(Configuration conf) throws Exception;
 
-    JobDetailsInfo getJobDetailsInfo(JobID jobID, Configuration conf) throws Exception;
+    /** Result of a cancel operation. */
+    @AllArgsConstructor
+    class CancelResult {
+        @Getter boolean pending;
+        String savepointPath;
 
-    /** Result of an in-place scaling operation. */
-    enum ScalingResult {
-        // Scaling triggered by the operation
-        SCALING_TRIGGERED,
-        // Job already scaled to target previously
-        ALREADY_SCALED,
-        // Cannot execute scaling, full upgrade required
-        CANNOT_SCALE;
+        public static CancelResult completed(String path) {
+            return new CancelResult(false, path);
+        }
+
+        public static CancelResult pending() {
+            return new CancelResult(true, null);
+        }
+
+        public Optional<String> getSavepointPath() {
+            return Optional.ofNullable(savepointPath);
+        }
     }
 }

@@ -42,8 +42,8 @@ The autoscaler relies on the metrics exposed by the Flink metric system for the 
 Collected metrics:
  - Backlog information at each source
  - Incoming data rate at the sources (e.g. records/sec written into the Kafka topic)
- - Number of records processed per second in each job vertex
- - Busy time per second of each job vertex (current utilization)
+ - Record processing rate at each job vertex
+ - Busy and backpressured time at each job vertex
 
 {{< hint info >}}
 Please note that we are not using any container memory / CPU utilization metrics directly here. High utilization will be reflected in the processing rate and busy time metrics of the individual job vertexes.
@@ -69,7 +69,7 @@ The autoscaler approach is based on [Three steps is all you need: fast, accurate
 
 ## Executing rescaling operations
 
-By default the autoscaler uses the built in job upgrade mechanism from the operator to perform the rescaling as detailed in [Job Management and Stateful upgrades]({{< ref "docs/custom-resource/job-management" >}}).
+By default, the autoscaler uses the built-in job upgrade mechanism from the operator to perform the rescaling as detailed in [Job Management and Stateful upgrades]({{< ref "docs/custom-resource/job-management" >}}).
 
 ### Flink 1.18 and in-place scaling support
 
@@ -99,9 +99,9 @@ For session job auto-scaling, a latest custom build of Flink 1.19 or 1.18 is req
 
 ### Limitations
 
-By default the autoscaler can work for all job vertices in the processing graph.
+By default, the autoscaler can work for all job vertices in the processing graph.
 
-However source scaling requires that the sources:
+However, source scaling requires that the sources:
 
    - Use the new [Source API](https://cwiki.apache.org/confluence/display/FLINK/FLIP-27%3A+Refactor+Source+Interface) that exposes the busy time metric (must have, most common connectors already do)
    - Expose the [standardized connector metrics](https://cwiki.apache.org/confluence/display/FLINK/FLIP-33%3A+Standardize+Connector+Metrics) for accessing backlog information (good to have, extra capacity will be added for catching up with backlog)
@@ -162,12 +162,14 @@ Setting `job.autoscaler.target.utilization.boundary: "0.2"` means that we allow 
 ### Target catch-up duration and restart time
 
 When taking scaling decisions the operator need to account for the extra capacity required to catch up the backlog created during scaling operations.
-The amount of extra capacity is determined automatically by the following 2 configs:
+The amount of extra capacity is determined automatically by the following 3 configs:
 
- - `job.autoscaler.restart.time` : Time it usually takes to restart the application
  - `job.autoscaler.catch-up.duration` : Time to job is expected to catch up after scaling
+ - `job.autoscaler.restart.time` : Time it usually takes to restart the application
+ - `job.autoscaler.restart.time-tracking.enabled` : Whether to use the actual observed rescaling restart times instead of the fixed 'job.autoscaler.restart.time' configuration. It's disabled by default.
 
-In the future the autoscaler may be able to automatically determine the restart time, but the target catch-up duration depends on the users SLO.
+The maximum restart duration over a number of samples will be used when `job.autoscaler.restart.time-tracking.enabled` is set to true, 
+but the target catch-up duration depends on the users SLO.
 
 By lowering the catch-up duration the autoscaler will have to reserve more extra capacity for the scaling actions.
 We suggest setting this based on your actual objective, such us 10,30,60 minutes etc.
@@ -260,7 +262,7 @@ job.autoscaler.metrics.window : 3m
 > `ScalingReport` will show the recommended parallelism for each vertex.
 
 After the flink job starts, please start the StandaloneAutoscaler process by the
-following command. Please download released autoscaler-standalone jar from 
+following command. Please download released autoscaler-standalone jar from
 [here](https://repo.maven.apache.org/maven2/org/apache/flink/flink-autoscaler-standalone/) first.
 
 ```
@@ -270,12 +272,19 @@ org.apache.flink.autoscaler.standalone.StandaloneAutoscalerEntrypoint \
 --autoscaler.standalone.fetcher.flink-cluster.port 8081
 ```
 
-Updating the `autoscaler.standalone.fetcher.flink-cluster.host` and `autoscaler.standalone.fetcher.flink-cluster.port` 
+Updating the `autoscaler.standalone.fetcher.flink-cluster.host` and `autoscaler.standalone.fetcher.flink-cluster.port`
 based on your flink cluster. In general, the host and port are the same as Flink WebUI.
 
-### Using the JDBC Autoscaler State Store
+All autoscaler related options can be set at autoscaler standalone level, and the configuration at job-level can 
+override the default value provided in the autoscaler standalone, such as:
 
-A driver dependency is required to connect to a specified database. Here are drivers currently supported, 
+- job.autoscaler.enabled
+- job.autoscaler.metrics.window
+- etc
+
+### Using the JDBC Autoscaler State Store & Event Handler
+
+A driver dependency is required to connect to a specified database. Here are drivers currently supported,
 please download JDBC driver and initialize database and table first.
 
 | Driver     | Group Id                   | Artifact Id            | JAR                                                                             | Schema                  |
@@ -286,19 +295,26 @@ please download JDBC driver and initialize database and table first.
 
 ```
 JDBC_DRIVER_JAR=./mysql-connector-java-8.0.30.jar
-# export the password of jdbc state store
-export STATE_STORE_JDBC_PWD=123456
+# export the password of jdbc state store & jdbc event handler
+export JDBC_PWD=123456
 
 java -cp flink-autoscaler-standalone-{{< version >}}.jar:${JDBC_DRIVER_JAR} \
 org.apache.flink.autoscaler.standalone.StandaloneAutoscalerEntrypoint \
 --autoscaler.standalone.fetcher.flink-cluster.host localhost \
 --autoscaler.standalone.fetcher.flink-cluster.port 8081 \
 --autoscaler.standalone.state-store.type jdbc \
---autoscaler.standalone.state-store.jdbc.url jdbc:mysql://localhost:3306/flink_autoscaler \
---autoscaler.standalone.state-store.jdbc.username root
+--autoscaler.standalone.event-handler.type jdbc \
+--autoscaler.standalone.jdbc.url jdbc:mysql://localhost:3306/flink_autoscaler \
+--autoscaler.standalone.jdbc.username root
 ```
 
-All supported options for autoscaler standalone can be viewed 
+### Load StandaloneAutoscaler configuration through configuration file
+
+Can specify the running configuration of StandaloneAutoscaler in the configuration file. The config.yaml and
+flink-conf.yaml files in the environment variable `FLINK_CONF_DIR` directory will be loaded by default.
+NOTE: main parameters will overwrite the configuration in the configuration file
+
+All supported options for autoscaler standalone can be viewed
 [here]({{< ref "docs/operations/configuration#autoscaler-standalone-configuration" >}}).
 
 ### Extensibility of autoscaler standalone

@@ -20,13 +20,15 @@ package org.apache.flink.autoscaler.standalone.flinkcluster;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.autoscaler.JobAutoScalerContext;
 import org.apache.flink.autoscaler.standalone.JobListFetcher;
+import org.apache.flink.autoscaler.utils.JobStatusUtils;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.rest.messages.EmptyMessageParameters;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
+import org.apache.flink.runtime.rest.messages.JobsOverviewHeaders;
 import org.apache.flink.runtime.rest.messages.job.JobManagerJobConfigurationHeaders;
 import org.apache.flink.util.function.FunctionWithException;
 
@@ -52,16 +54,21 @@ public class FlinkClusterJobListFetcher
     }
 
     @Override
-    public Collection<JobAutoScalerContext<JobID>> fetch() throws Exception {
+    public Collection<JobAutoScalerContext<JobID>> fetch(Configuration baseConf) throws Exception {
         try (var restClusterClient = restClientGetter.apply(new Configuration())) {
             return restClusterClient
-                    .listJobs()
+                    .sendRequest(
+                            JobsOverviewHeaders.getInstance(),
+                            EmptyMessageParameters.getInstance(),
+                            EmptyRequestBody.getInstance())
+                    .thenApply(JobStatusUtils::toJobStatusMessage)
                     .get(restClientTimeout.toSeconds(), TimeUnit.SECONDS)
                     .stream()
                     .map(
                             jobStatusMessage -> {
                                 try {
-                                    return generateJobContext(restClusterClient, jobStatusMessage);
+                                    return generateJobContext(
+                                            baseConf, restClusterClient, jobStatusMessage);
                                 } catch (Throwable e) {
                                     throw new RuntimeException(
                                             "generateJobContext throw exception", e);
@@ -72,10 +79,12 @@ public class FlinkClusterJobListFetcher
     }
 
     private JobAutoScalerContext<JobID> generateJobContext(
-            RestClusterClient<String> restClusterClient, JobStatusMessage jobStatusMessage)
+            Configuration baseConf,
+            RestClusterClient<String> restClusterClient,
+            JobStatusMessage jobStatusMessage)
             throws Exception {
         var jobId = jobStatusMessage.getJobId();
-        var conf = getConfiguration(restClusterClient, jobId);
+        var conf = getConfiguration(baseConf, restClusterClient, jobId);
 
         return new JobAutoScalerContext<>(
                 jobId,
@@ -83,12 +92,11 @@ public class FlinkClusterJobListFetcher
                 jobStatusMessage.getJobState(),
                 conf,
                 new UnregisteredMetricsGroup(),
-                0,
-                MemorySize.ZERO,
                 () -> restClientGetter.apply(conf));
     }
 
-    private Configuration getConfiguration(RestClusterClient<String> restClusterClient, JobID jobId)
+    private Configuration getConfiguration(
+            Configuration baseConf, RestClusterClient<String> restClusterClient, JobID jobId)
             throws Exception {
         var jobParameters = new JobMessageParameters();
         jobParameters.jobPathParameter.resolve(jobId);
@@ -101,7 +109,7 @@ public class FlinkClusterJobListFetcher
                                 EmptyRequestBody.getInstance())
                         .get(restClientTimeout.toSeconds(), TimeUnit.SECONDS);
 
-        var conf = new Configuration();
+        var conf = new Configuration(baseConf);
         configurationInfo.forEach(entry -> conf.setString(entry.getKey(), entry.getValue()));
         return conf;
     }

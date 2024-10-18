@@ -17,10 +17,14 @@
 
 package org.apache.flink.autoscaler.state;
 
+import org.apache.flink.autoscaler.DelayedScaleDown;
 import org.apache.flink.autoscaler.JobAutoScalerContext;
+import org.apache.flink.autoscaler.ScalingRecord;
 import org.apache.flink.autoscaler.ScalingSummary;
+import org.apache.flink.autoscaler.ScalingTracking;
 import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.autoscaler.metrics.CollectedMetrics;
+import org.apache.flink.autoscaler.tuning.ConfigChanges;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
 import org.junit.jupiter.api.Assertions;
@@ -175,6 +179,13 @@ public abstract class AbstractAutoScalerStateStoreTest<
 
     @Test
     protected void testDiscardAllState() throws Exception {
+        assertThat(stateStore.getCollectedMetrics(ctx)).isEmpty();
+        assertThat(stateStore.getScalingHistory(ctx)).isEmpty();
+        assertThat(stateStore.getParallelismOverrides(ctx)).isEmpty();
+        assertThat(stateStore.getConfigChanges(ctx).getOverrides()).isEmpty();
+        assertThat(stateStore.getScalingTracking(ctx).getScalingRecords()).isEmpty();
+        assertThat(stateStore.getDelayedScaleDown(ctx).getFirstTriggerTime()).isEmpty();
+
         stateStore.storeCollectedMetrics(
                 ctx, new TreeMap<>(Map.of(Instant.now(), new CollectedMetrics())));
         stateStore.storeScalingHistory(
@@ -183,21 +194,46 @@ public abstract class AbstractAutoScalerStateStoreTest<
                         new JobVertexID(),
                         new TreeMap<>(Map.of(Instant.now(), new ScalingSummary()))));
         stateStore.storeParallelismOverrides(ctx, Map.of(new JobVertexID().toHexString(), "23"));
+        stateStore.storeConfigChanges(
+                ctx, new ConfigChanges().addOverride("config.value", "value"));
+
+        var scalingTracking = new ScalingTracking();
+        scalingTracking.addScalingRecord(
+                Instant.now().minus(Duration.ofHours(3)), new ScalingRecord());
+        scalingTracking.addScalingRecord(
+                Instant.now().minus(Duration.ofHours(2)), new ScalingRecord());
+        scalingTracking.addScalingRecord(
+                Instant.now().minus(Duration.ofHours(1)), new ScalingRecord());
+        stateStore.storeScalingTracking(ctx, scalingTracking);
+
+        var firstTriggerTime = Map.of(new JobVertexID(), Instant.now());
+        stateStore.storeDelayedScaleDown(ctx, new DelayedScaleDown(firstTriggerTime));
 
         assertThat(stateStore.getCollectedMetrics(ctx)).isNotEmpty();
         assertThat(stateStore.getScalingHistory(ctx)).isNotEmpty();
         assertThat(stateStore.getParallelismOverrides(ctx)).isNotEmpty();
+        assertThat(stateStore.getConfigChanges(ctx).getOverrides()).isNotEmpty();
+        assertThat(stateStore.getScalingTracking(ctx)).isEqualTo(scalingTracking);
+        assertThat(stateStore.getDelayedScaleDown(ctx).getFirstTriggerTime())
+                .isEqualTo(firstTriggerTime);
 
         stateStore.flush(ctx);
 
         assertThat(stateStore.getCollectedMetrics(ctx)).isNotEmpty();
         assertThat(stateStore.getScalingHistory(ctx)).isNotEmpty();
         assertThat(stateStore.getParallelismOverrides(ctx)).isNotEmpty();
+        assertThat(stateStore.getConfigChanges(ctx).getOverrides()).isNotEmpty();
+        assertThat(stateStore.getScalingTracking(ctx)).isEqualTo(scalingTracking);
+        assertThat(stateStore.getDelayedScaleDown(ctx).getFirstTriggerTime())
+                .isEqualTo(firstTriggerTime);
 
         stateStore.clearAll(ctx);
 
         assertThat(stateStore.getCollectedMetrics(ctx)).isEmpty();
         assertThat(stateStore.getScalingHistory(ctx)).isEmpty();
         assertThat(stateStore.getParallelismOverrides(ctx)).isEmpty();
+        assertThat(stateStore.getConfigChanges(ctx).getOverrides()).isEmpty();
+        assertThat(stateStore.getScalingTracking(ctx).getScalingRecords()).isEmpty();
+        assertThat(stateStore.getDelayedScaleDown(ctx).getFirstTriggerTime()).isEmpty();
     }
 }

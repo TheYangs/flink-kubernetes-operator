@@ -22,10 +22,15 @@ import org.apache.flink.autoscaler.JobAutoScalerContext;
 import org.apache.flink.autoscaler.ScalingSummary;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+
 import javax.annotation.Nullable;
 
+import java.io.Closeable;
 import java.time.Duration;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.EXPECTED_PROCESSING_RATE;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.TARGET_DATA_RATE;
@@ -38,9 +43,10 @@ import static org.apache.flink.autoscaler.metrics.ScalingMetric.TRUE_PROCESSING_
  * @param <Context> Instance of JobAutoScalerContext.
  */
 @Experimental
-public interface AutoScalerEventHandler<KEY, Context extends JobAutoScalerContext<KEY>> {
+public interface AutoScalerEventHandler<KEY, Context extends JobAutoScalerContext<KEY>>
+        extends Closeable {
     String SCALING_SUMMARY_ENTRY =
-            " Vertex ID %s | Parallelism %d -> %d | Processing capacity %.2f -> %.2f | Target data rate %.2f";
+            "{ Vertex ID %s | Parallelism %d -> %d | Processing capacity %.2f -> %.2f | Target data rate %.2f}";
     String SCALING_EXECUTION_DISABLED_REASON = "%s:%s, recommended parallelism change:";
     String SCALING_SUMMARY_HEADER_SCALING_EXECUTION_DISABLED =
             "Scaling execution disabled by config ";
@@ -61,6 +67,17 @@ public interface AutoScalerEventHandler<KEY, Context extends JobAutoScalerContex
             String message,
             @Nullable String messageKey,
             @Nullable Duration interval);
+
+    /**
+     * Handle exception, and the exception event is warning type and don't deduplicate by default.
+     */
+    default void handleException(Context context, String reason, Throwable e) {
+        var message = e.getMessage();
+        if (message == null) {
+            message = StringUtils.abbreviate(ExceptionUtils.getStackTrace(e), 2048);
+        }
+        handleEvent(context, Type.Warning, reason, message, null, null);
+    }
 
     /**
      * Handle scaling reports.
@@ -84,6 +101,9 @@ public interface AutoScalerEventHandler<KEY, Context extends JobAutoScalerContex
                 interval);
     }
 
+    /** Close the related resource. */
+    default void close() {}
+
     static String scalingReport(Map<JobVertexID, ScalingSummary> scalingSummaries, String message) {
         StringBuilder sb = new StringBuilder(message);
         scalingSummaries.forEach(
@@ -98,6 +118,22 @@ public interface AutoScalerEventHandler<KEY, Context extends JobAutoScalerContex
                                         s.getMetrics().get(EXPECTED_PROCESSING_RATE).getCurrent(),
                                         s.getMetrics().get(TARGET_DATA_RATE).getAverage())));
         return sb.toString();
+    }
+
+    static String getParallelismHashCode(Map<JobVertexID, ScalingSummary> scalingSummaryHashMap) {
+        return Integer.toString(
+                scalingSummaryHashMap.entrySet().stream()
+                                .collect(
+                                        Collectors.toMap(
+                                                e -> e.getKey().toString(),
+                                                e ->
+                                                        String.format(
+                                                                "Parallelism %d -> %d",
+                                                                e.getValue()
+                                                                        .getCurrentParallelism(),
+                                                                e.getValue().getNewParallelism())))
+                                .hashCode()
+                        & 0x7FFFFFFF);
     }
 
     /** The type of the events. */

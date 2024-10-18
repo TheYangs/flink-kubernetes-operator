@@ -35,8 +35,6 @@ import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
-import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
-import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
 import org.apache.flink.kubernetes.operator.artifact.ArtifactManager;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
@@ -49,23 +47,27 @@ import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexResourceRequirements;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
-import org.apache.flink.runtime.rest.messages.job.JobDetailsInfo;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsBody;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsHeaders;
 import org.apache.flink.runtime.rest.messages.job.JobResourcesRequirementsUpdateHeaders;
 
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
-import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.PodList;
+import io.fabric8.kubernetes.api.model.apps.Deployment;
+import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.EditReplacePatchable;
+import io.fabric8.kubernetes.client.dsl.base.PatchContext;
+import io.fabric8.kubernetes.client.dsl.base.PatchType;
+import org.apache.commons.lang3.ObjectUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 import static org.apache.flink.kubernetes.operator.config.FlinkConfigBuilder.FLINK_VERSION;
 
@@ -76,6 +78,9 @@ import static org.apache.flink.kubernetes.operator.config.FlinkConfigBuilder.FLI
 public class NativeFlinkService extends AbstractFlinkService {
 
     private static final Logger LOG = LoggerFactory.getLogger(NativeFlinkService.class);
+    private static final Deployment SCALE_TO_ZERO =
+            new DeploymentBuilder().editOrNewSpec().withReplicas(0).endSpec().build();
+    private static final Duration JM_SHUTDOWN_MAX_WAIT = Duration.ofMinutes(1);
     private final EventRecorder eventRecorder;
 
     public NativeFlinkService(
@@ -111,10 +116,10 @@ public class NativeFlinkService extends AbstractFlinkService {
     }
 
     @Override
-    public void cancelJob(
-            FlinkDeployment deployment, UpgradeMode upgradeMode, Configuration configuration)
+    public CancelResult cancelJob(
+            FlinkDeployment deployment, SuspendMode suspendMode, Configuration configuration)
             throws Exception {
-        cancelJob(deployment, upgradeMode, configuration, false);
+        return cancelJob(deployment, suspendMode, configuration, false);
     }
 
     @Override
@@ -124,12 +129,6 @@ public class NativeFlinkService extends AbstractFlinkService {
                 .inNamespace(namespace)
                 .withLabels(KubernetesUtils.getJobManagerSelectors(clusterId))
                 .list();
-    }
-
-    @Override
-    protected PodList getTmPodList(String namespace, String clusterId) {
-        // Native mode does not manage TaskManager
-        return new PodList();
     }
 
     protected void submitClusterInternal(Configuration conf) throws Exception {
@@ -148,50 +147,49 @@ public class NativeFlinkService extends AbstractFlinkService {
 
     @Override
     protected void deleteClusterInternal(
-            ObjectMeta meta,
+            String namespace,
+            String clusterId,
             Configuration conf,
-            boolean deleteHaData,
             DeletionPropagation deletionPropagation) {
 
-        String namespace = meta.getNamespace();
-        String clusterId = meta.getName();
+        var jmDeployment =
+                kubernetesClient
+                        .apps()
+                        .deployments()
+                        .inNamespace(namespace)
+                        .withName(KubernetesUtils.getDeploymentName(clusterId));
 
-        LOG.info(
-                "Deleting JobManager deployment {}.",
-                deleteHaData ? "and HA metadata" : "while preserving HA metadata");
-        kubernetesClient
-                .apps()
-                .deployments()
-                .inNamespace(namespace)
-                .withName(KubernetesUtils.getDeploymentName(clusterId))
-                .withPropagationPolicy(deletionPropagation)
-                .delete();
+        var remainingTimeout = operatorConfig.getFlinkShutdownClusterTimeout();
 
-        if (deleteHaData) {
-            deleteHAData(namespace, clusterId, conf);
+        // We shut down the JobManager first in the (default) Foreground propagation case to have a
+        // cleaner exit
+        if (deletionPropagation == DeletionPropagation.FOREGROUND) {
+            remainingTimeout =
+                    shutdownJobManagersBlocking(
+                            jmDeployment, namespace, clusterId, remainingTimeout);
         }
+        deleteDeploymentBlocking("JobManager", jmDeployment, deletionPropagation, remainingTimeout);
     }
 
     @Override
-    public ScalingResult scale(FlinkResourceContext<?> ctx, Configuration deployConfig)
-            throws Exception {
+    public boolean scale(FlinkResourceContext<?> ctx, Configuration deployConfig) throws Exception {
         var resource = ctx.getResource();
         var observeConfig = ctx.getObserveConfig();
 
         if (!supportsInPlaceScaling(resource, observeConfig)) {
-            return ScalingResult.CANNOT_SCALE;
+            return false;
         }
 
         var newOverrides = deployConfig.get(PipelineOptions.PARALLELISM_OVERRIDES);
         var previousOverrides = observeConfig.get(PipelineOptions.PARALLELISM_OVERRIDES);
         if (newOverrides.isEmpty() && previousOverrides.isEmpty()) {
             LOG.info("No overrides defined before or after. Cannot scale in-place.");
-            return ScalingResult.CANNOT_SCALE;
+            return false;
         }
 
         try (var client = getClusterClient(observeConfig)) {
             var requirements = new HashMap<>(getVertexResources(client, resource));
-            var result = ScalingResult.ALREADY_SCALED;
+            var alreadyScaled = true;
 
             for (Map.Entry<JobVertexID, JobVertexResourceRequirements> entry :
                     requirements.entrySet()) {
@@ -200,24 +198,30 @@ public class NativeFlinkService extends AbstractFlinkService {
                 var overrideStr = newOverrides.get(jobId);
 
                 if (overrideStr != null) {
-                    // We have an override for the vertex
-                    int p = Integer.parseInt(overrideStr);
-                    var newParallelism = new JobVertexResourceRequirements.Parallelism(p, p);
+                    // We set the parallelism upper bound to the target parallelism, anything higher
+                    // would defeat the purpose of scaling down
+                    int upperBound = Integer.parseInt(overrideStr);
+                    // We only change the lower bound if the new parallelism went below it. As we
+                    // cannot guarantee that new resources can be acquired, increasing the lower
+                    // bound to the target could potentially cause job failure.
+                    int lowerBound = Math.min(upperBound, parallelism.getLowerBound());
+                    var newParallelism =
+                            new JobVertexResourceRequirements.Parallelism(lowerBound, upperBound);
                     // If the requirements changed we mark this as scaling triggered
                     if (!parallelism.equals(newParallelism)) {
                         entry.setValue(new JobVertexResourceRequirements(newParallelism));
-                        result = ScalingResult.SCALING_TRIGGERED;
+                        alreadyScaled = false;
                     }
                 } else if (previousOverrides.containsKey(jobId)) {
                     LOG.info(
                             "Parallelism override for {} has been removed, falling back to regular upgrade.",
                             jobId);
-                    return ScalingResult.CANNOT_SCALE;
+                    return false;
                 } else {
                     // No overrides for this vertex
                 }
             }
-            if (result == ScalingResult.ALREADY_SCALED) {
+            if (alreadyScaled) {
                 LOG.info("Vertex resources requirements already match target, nothing to do...");
             } else {
                 updateVertexResources(client, resource, requirements);
@@ -229,10 +233,10 @@ public class NativeFlinkService extends AbstractFlinkService {
                         "In-place scaling triggered",
                         ctx.getKubernetesClient());
             }
-            return result;
+            return true;
         } catch (Throwable t) {
             LOG.error("Error while rescaling, falling back to regular upgrade", t);
-            return ScalingResult.CANNOT_SCALE;
+            return false;
         }
     }
 
@@ -244,7 +248,7 @@ public class NativeFlinkService extends AbstractFlinkService {
             return false;
         }
 
-        if (!observeConfig.get(FLINK_VERSION).isNewerVersionThan(FlinkVersion.v1_17)) {
+        if (!observeConfig.get(FLINK_VERSION).isEqualOrNewer(FlinkVersion.v1_18)) {
             LOG.debug("In-place rescaling is only available starting from Flink 1.18");
             return false;
         }
@@ -258,7 +262,7 @@ public class NativeFlinkService extends AbstractFlinkService {
 
         var status = resource.getStatus();
         if (ReconciliationUtils.isJobInTerminalState(status)
-                || JobStatus.RECONCILING.name().equals(status.getJobStatus().getState())) {
+                || JobStatus.RECONCILING.equals(status.getJobStatus().getState())) {
             LOG.info("Job in terminal or reconciling state cannot be scaled in-place");
             return false;
         }
@@ -299,49 +303,43 @@ public class NativeFlinkService extends AbstractFlinkService {
         return currentRequirements.asJobResourceRequirements().get().getJobVertexParallelisms();
     }
 
-    @Override
-    public boolean scalingCompleted(FlinkResourceContext<?> ctx) {
-        var conf = ctx.getObserveConfig();
-        var status = ctx.getResource().getStatus();
-        try (var client = ctx.getFlinkService().getClusterClient(conf)) {
-            var jobId = JobID.fromHexString(status.getJobStatus().getJobId());
-            var jobDetailsInfo = client.getJobDetails(jobId).get();
+    /**
+     * Shut down JobManagers gracefully by scaling JM deployment to zero. This avoids race
+     * conditions between JM shutdown and TM shutdown / failure handling.
+     *
+     * @param jmDeployment
+     * @param namespace
+     * @param clusterId
+     * @param remainingTimeout
+     * @return Remaining timeout after the operation.
+     */
+    private Duration shutdownJobManagersBlocking(
+            EditReplacePatchable<Deployment> jmDeployment,
+            String namespace,
+            String clusterId,
+            Duration remainingTimeout) {
 
-            // Return false on empty jobgraph
-            if (jobDetailsInfo.getJobVertexInfos().isEmpty()) {
-                return false;
-            }
-
-            Map<JobVertexID, Integer> currentParallelisms =
-                    jobDetailsInfo.getJobVertexInfos().stream()
-                            .collect(
-                                    Collectors.toMap(
-                                            JobDetailsInfo.JobVertexDetailsInfo::getJobVertexID,
-                                            JobDetailsInfo.JobVertexDetailsInfo::getParallelism));
-
-            Map<String, String> parallelismOverrides =
-                    conf.get(PipelineOptions.PARALLELISM_OVERRIDES);
-            for (Map.Entry<JobVertexID, Integer> entry : currentParallelisms.entrySet()) {
-                String override = parallelismOverrides.get(entry.getKey().toHexString());
-                if (override == null) {
-                    // No override defined for this vertex
-                    continue;
-                }
-                Integer overrideParallelism = Integer.valueOf(override);
-                if (!overrideParallelism.equals(entry.getValue())) {
-                    LOG.info(
-                            "Scaling still in progress for vertex {}, {} -> {}",
-                            entry.getKey(),
-                            entry.getValue(),
-                            overrideParallelism);
-                    return false;
-                }
-            }
-            LOG.info("All vertexes have successfully scaled");
-            status.getReconciliationStatus().setState(ReconciliationState.DEPLOYED);
-            return true;
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        // We use only half of the shutdown timeout but at most one minute as the main point
+        // here is to initiate JM shutdown before the TMs
+        var jmShutdownTimeout =
+                ObjectUtils.min(JM_SHUTDOWN_MAX_WAIT, remainingTimeout.dividedBy(2));
+        var remaining =
+                deleteBlocking(
+                        "Scaling JobManager Deployment to zero",
+                        () -> {
+                            try {
+                                jmDeployment.patch(
+                                        PatchContext.of(PatchType.JSON_MERGE), SCALE_TO_ZERO);
+                            } catch (Exception ignore) {
+                                // Ignore all errors here as this is an optional step
+                                return null;
+                            }
+                            return kubernetesClient
+                                    .pods()
+                                    .inNamespace(namespace)
+                                    .withLabels(KubernetesUtils.getJobManagerSelectors(clusterId));
+                        },
+                        jmShutdownTimeout);
+        return remainingTimeout.minus(jmShutdownTimeout).plus(remaining);
     }
 }

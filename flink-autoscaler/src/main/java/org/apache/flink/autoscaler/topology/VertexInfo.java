@@ -17,30 +17,85 @@
 
 package org.apache.flink.autoscaler.topology;
 
+import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.runtime.instance.SlotSharingGroupId;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
-import lombok.RequiredArgsConstructor;
-import lombok.Value;
+import lombok.AccessLevel;
+import lombok.Data;
+import lombok.Setter;
 
-import java.util.Set;
+import java.util.Map;
 
 /** Job vertex information. */
-@Value
-@RequiredArgsConstructor
+@Data
 public class VertexInfo {
 
-    JobVertexID id;
+    private final JobVertexID id;
 
-    Set<JobVertexID> inputs;
+    // All input vertices and the ship_strategy
+    private final Map<JobVertexID, ShipStrategy> inputs;
 
-    int parallelism;
+    private final SlotSharingGroupId slotSharingGroupId;
 
-    int maxParallelism;
+    // All output vertices and the ship_strategy
+    private Map<JobVertexID, ShipStrategy> outputs;
 
-    boolean finished;
+    private final int parallelism;
+
+    @Setter(AccessLevel.NONE)
+    private int maxParallelism;
+
+    @Setter private int numSourcePartitions;
+
+    private final boolean finished;
+
+    private IOMetrics ioMetrics;
 
     public VertexInfo(
-            JobVertexID id, Set<JobVertexID> inputs, int parallelism, int maxParallelism) {
-        this(id, inputs, parallelism, maxParallelism, false);
+            JobVertexID id,
+            SlotSharingGroupId slotSharingGroupId,
+            Map<JobVertexID, ShipStrategy> inputs,
+            int parallelism,
+            int maxParallelism,
+            boolean finished,
+            IOMetrics ioMetrics) {
+        this.id = id;
+        this.slotSharingGroupId = slotSharingGroupId;
+        this.inputs = inputs;
+        this.parallelism = parallelism;
+        this.maxParallelism = maxParallelism;
+        this.finished = finished;
+        this.ioMetrics = ioMetrics;
+    }
+
+    @VisibleForTesting
+    public VertexInfo(
+            JobVertexID id,
+            Map<JobVertexID, ShipStrategy> inputs,
+            int parallelism,
+            int maxParallelism,
+            IOMetrics ioMetrics) {
+        this(id, null, inputs, parallelism, maxParallelism, false, ioMetrics);
+    }
+
+    @VisibleForTesting
+    public VertexInfo(
+            JobVertexID id,
+            Map<JobVertexID, ShipStrategy> inputs,
+            int parallelism,
+            int maxParallelism,
+            boolean finished,
+            IOMetrics ioMetrics) {
+        this(id, null, inputs, parallelism, maxParallelism, finished, ioMetrics);
+    }
+
+    @VisibleForTesting
+    public VertexInfo(
+            JobVertexID id,
+            Map<JobVertexID, ShipStrategy> inputs,
+            int parallelism,
+            int maxParallelism) {
+        this(id, inputs, parallelism, maxParallelism, null);
     }
 }

@@ -18,10 +18,12 @@
 package org.apache.flink.autoscaler.state;
 
 import org.apache.flink.annotation.Experimental;
+import org.apache.flink.autoscaler.DelayedScaleDown;
 import org.apache.flink.autoscaler.JobAutoScalerContext;
 import org.apache.flink.autoscaler.ScalingSummary;
 import org.apache.flink.autoscaler.ScalingTracking;
 import org.apache.flink.autoscaler.metrics.CollectedMetrics;
+import org.apache.flink.autoscaler.tuning.ConfigChanges;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
 import javax.annotation.Nonnull;
@@ -68,6 +70,19 @@ public interface AutoScalerStateStore<KEY, Context extends JobAutoScalerContext<
     Map<String, String> getParallelismOverrides(Context jobContext) throws Exception;
 
     void removeParallelismOverrides(Context jobContext) throws Exception;
+
+    void storeConfigChanges(Context jobContext, ConfigChanges configChanges) throws Exception;
+
+    @Nonnull
+    ConfigChanges getConfigChanges(Context jobContext) throws Exception;
+
+    void removeConfigChanges(Context jobContext) throws Exception;
+
+    void storeDelayedScaleDown(Context jobContext, DelayedScaleDown delayedScaleDown)
+            throws Exception;
+
+    @Nonnull
+    DelayedScaleDown getDelayedScaleDown(Context jobContext) throws Exception;
 
     /** Removes all data from this context. Flush stil needs to be called. */
     void clearAll(Context jobContext) throws Exception;

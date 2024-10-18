@@ -24,6 +24,7 @@ import org.apache.flink.autoscaler.JobAutoScalerContext;
 import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.autoscaler.event.AutoScalerEventHandler;
 import org.apache.flink.autoscaler.realizer.ScalingRealizer;
+import org.apache.flink.autoscaler.tuning.ConfigChanges;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -64,7 +65,8 @@ public class RescaleApiScalingRealizer<KEY, Context extends JobAutoScalerContext
     }
 
     @Override
-    public void realize(Context context, Map<String, String> parallelismOverrides) {
+    public void realizeParallelismOverrides(
+            Context context, Map<String, String> parallelismOverrides) throws Exception {
         Configuration conf = context.getConfiguration();
         if (!conf.get(JobManagerOptions.SCHEDULER)
                 .equals(JobManagerOptions.SchedulerType.Adaptive)) {
@@ -119,9 +121,16 @@ public class RescaleApiScalingRealizer<KEY, Context extends JobAutoScalerContext
             } else {
                 LOG.info("Vertex resources requirements already match target, nothing to do...");
             }
-        } catch (Exception e) {
-            LOG.warn("Failed to apply parallelism overrides.", e);
         }
+    }
+
+    @Override
+    public void realizeConfigOverrides(Context context, ConfigChanges configChanges) {
+        // Not currently supported
+        LOG.warn(
+                "{} does not support updating the TaskManager configuration ({})",
+                getClass().getSimpleName(),
+                configChanges);
     }
 
     private Map<JobVertexID, JobVertexResourceRequirements> getVertexResources(

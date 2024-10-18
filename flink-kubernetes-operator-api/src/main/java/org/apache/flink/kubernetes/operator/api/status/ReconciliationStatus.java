@@ -20,7 +20,6 @@ package org.apache.flink.kubernetes.operator.api.status;
 import org.apache.flink.annotation.Experimental;
 import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.spec.AbstractFlinkSpec;
-import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.api.utils.SpecWithMeta;
 
@@ -81,6 +80,7 @@ public abstract class ReconciliationStatus<SPEC extends AbstractFlinkSpec> {
     public void serializeAndSetLastReconciledSpec(
             SPEC spec, AbstractFlinkResource<SPEC, ?> resource) {
         setLastReconciledSpec(SpecUtils.writeSpecWithMeta(spec, resource));
+        resource.getStatus().setObservedGeneration(resource.getMetadata().getGeneration());
     }
 
     public void markReconciledSpecAsStable() {
@@ -98,15 +98,5 @@ public abstract class ReconciliationStatus<SPEC extends AbstractFlinkSpec> {
     @JsonIgnore
     public boolean isBeforeFirstDeployment() {
         return lastReconciledSpec == null;
-    }
-
-    @JsonIgnore
-    public boolean scalingInProgress() {
-        if (isBeforeFirstDeployment() || state != ReconciliationState.UPGRADING) {
-            return false;
-        }
-        var job = deserializeLastReconciledSpec().getJob();
-        // For regular full upgrades the jobstate is suspended in UPGRADING state
-        return job != null && job.getState() == JobState.RUNNING;
     }
 }

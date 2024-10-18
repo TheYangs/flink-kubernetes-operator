@@ -26,10 +26,14 @@ import org.apache.flink.autoscaler.metrics.ScalingMetric;
 import org.apache.flink.autoscaler.resources.NoopResourceCheck;
 import org.apache.flink.autoscaler.resources.ResourceCheck;
 import org.apache.flink.autoscaler.state.AutoScalerStateStore;
+import org.apache.flink.autoscaler.topology.JobTopology;
+import org.apache.flink.autoscaler.tuning.MemoryTuning;
 import org.apache.flink.autoscaler.utils.CalendarUtils;
+import org.apache.flink.autoscaler.utils.ResourceCheckUtils;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.runtime.instance.SlotSharingGroupId;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
 import org.slf4j.Logger;
@@ -41,9 +45,13 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
 
+import static org.apache.flink.autoscaler.JobVertexScaler.ParallelismChangeType.NO_CHANGE;
+import static org.apache.flink.autoscaler.JobVertexScaler.ParallelismChangeType.REQUIRED_CHANGE;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.EXCLUDED_PERIODS;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALING_ENABLED;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALING_EVENT_INTERVAL;
@@ -63,6 +71,9 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
 
     public static final String HEAP_USAGE_MESSAGE =
             "Heap Usage %s is above the allowed limit for scaling operations. Please adjust the available memory manually.";
+
+    public static final String RESOURCE_QUOTA_REACHED_MESSAGE =
+            "Resource usage is above the allowed limit for scaling operations. Please adjust the resource quota manually.";
 
     private static final Logger LOG = LoggerFactory.getLogger(ScalingExecutor.class);
 
@@ -92,21 +103,24 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
             EvaluatedMetrics evaluatedMetrics,
             Map<JobVertexID, SortedMap<Instant, ScalingSummary>> scalingHistory,
             ScalingTracking scalingTracking,
-            Instant now)
+            Instant now,
+            JobTopology jobTopology,
+            DelayedScaleDown delayedScaleDown)
             throws Exception {
         var conf = context.getConfiguration();
         var restartTime = scalingTracking.getMaxRestartTimeOrDefault(conf);
 
         var scalingSummaries =
-                computeScalingSummary(context, evaluatedMetrics, scalingHistory, restartTime);
+                computeScalingSummary(
+                        context,
+                        evaluatedMetrics,
+                        scalingHistory,
+                        restartTime,
+                        jobTopology,
+                        delayedScaleDown);
 
         if (scalingSummaries.isEmpty()) {
             LOG.info("All job vertices are currently running at their target parallelism.");
-            return false;
-        }
-
-        if (allVerticesWithinUtilizationTarget(
-                evaluatedMetrics.getVertexMetrics(), scalingSummaries)) {
             return false;
         }
 
@@ -116,7 +130,21 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
             return false;
         }
 
-        if (scalingWouldExceedClusterResources(evaluatedMetrics, scalingSummaries, context)) {
+        var configOverrides =
+                MemoryTuning.tuneTaskManagerMemory(
+                        context,
+                        evaluatedMetrics,
+                        jobTopology,
+                        scalingSummaries,
+                        autoScalerEventHandler);
+
+        var memoryTuningEnabled = conf.get(AutoScalerOptions.MEMORY_TUNING_ENABLED);
+        if (scalingWouldExceedMaxResources(
+                memoryTuningEnabled ? configOverrides.newConfigWithOverrides(conf) : conf,
+                jobTopology,
+                evaluatedMetrics,
+                scalingSummaries,
+                context)) {
             return false;
         }
 
@@ -130,6 +158,11 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
                 context,
                 getVertexParallelismOverrides(
                         evaluatedMetrics.getVertexMetrics(), scalingSummaries));
+
+        autoScalerStateStore.storeConfigChanges(context, configOverrides);
+
+        // Try to clear all delayed scale down requests after scaling.
+        delayedScaleDown.clearAll();
 
         return true;
     }
@@ -147,23 +180,28 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
                                                 scalingSummary.getNewParallelism())));
     }
 
-    protected static boolean allVerticesWithinUtilizationTarget(
+    @VisibleForTesting
+    static boolean allRequiredVerticesWithinUtilizationTarget(
             Map<JobVertexID, Map<ScalingMetric, EvaluatedScalingMetric>> evaluatedMetrics,
-            Map<JobVertexID, ScalingSummary> scalingSummaries) {
+            Set<JobVertexID> requiredVertices) {
+        // All vertices' ParallelismChange is optional, rescaling will be ignored.
+        if (requiredVertices.isEmpty()) {
+            return true;
+        }
 
-        for (Map.Entry<JobVertexID, ScalingSummary> entry : scalingSummaries.entrySet()) {
-            var vertex = entry.getKey();
+        for (JobVertexID vertex : requiredVertices) {
             var metrics = evaluatedMetrics.get(vertex);
 
-            double processingRate = metrics.get(TRUE_PROCESSING_RATE).getAverage();
+            double trueProcessingRate = metrics.get(TRUE_PROCESSING_RATE).getAverage();
             double scaleUpRateThreshold = metrics.get(SCALE_UP_RATE_THRESHOLD).getCurrent();
             double scaleDownRateThreshold = metrics.get(SCALE_DOWN_RATE_THRESHOLD).getCurrent();
 
-            if (processingRate < scaleUpRateThreshold || processingRate > scaleDownRateThreshold) {
+            if (trueProcessingRate < scaleUpRateThreshold
+                    || trueProcessingRate > scaleDownRateThreshold) {
                 LOG.debug(
                         "Vertex {} processing rate {} is outside ({}, {})",
                         vertex,
-                        processingRate,
+                        trueProcessingRate,
                         scaleUpRateThreshold,
                         scaleDownRateThreshold);
                 return false;
@@ -171,7 +209,7 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
                 LOG.debug(
                         "Vertex {} processing rate {} is within target ({}, {})",
                         vertex,
-                        processingRate,
+                        trueProcessingRate,
                         scaleUpRateThreshold,
                         scaleDownRateThreshold);
             }
@@ -185,7 +223,9 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
             Context context,
             EvaluatedMetrics evaluatedMetrics,
             Map<JobVertexID, SortedMap<Instant, ScalingSummary>> scalingHistory,
-            Duration restartTime) {
+            Duration restartTime,
+            JobTopology jobTopology,
+            DelayedScaleDown delayedScaleDown) {
         LOG.debug("Restart time used in scaling summary computation: {}", restartTime);
 
         if (isJobUnderMemoryPressure(context, evaluatedMetrics.getGlobalMetrics())) {
@@ -194,6 +234,8 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
         }
 
         var out = new HashMap<JobVertexID, ScalingSummary>();
+        var requiredVertices = new HashSet<JobVertexID>();
+
         var excludeVertexIdList =
                 context.getConfiguration().get(AutoScalerOptions.VERTEX_EXCLUDE_IDS);
         evaluatedMetrics
@@ -207,22 +249,38 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
                             } else {
                                 var currentParallelism =
                                         (int) metrics.get(ScalingMetric.PARALLELISM).getCurrent();
-                                var newParallelism =
+
+                                var parallelismChange =
                                         jobVertexScaler.computeScaleTargetParallelism(
                                                 context,
                                                 v,
+                                                jobTopology.get(v).getInputs().values(),
                                                 metrics,
                                                 scalingHistory.getOrDefault(
                                                         v, Collections.emptySortedMap()),
-                                                restartTime);
-                                if (currentParallelism != newParallelism) {
-                                    out.put(
-                                            v,
-                                            new ScalingSummary(
-                                                    currentParallelism, newParallelism, metrics));
+                                                restartTime,
+                                                delayedScaleDown);
+                                if (NO_CHANGE == parallelismChange.getChangeType()) {
+                                    return;
+                                } else if (REQUIRED_CHANGE == parallelismChange.getChangeType()) {
+                                    requiredVertices.add(v);
                                 }
+                                out.put(
+                                        v,
+                                        new ScalingSummary(
+                                                currentParallelism,
+                                                parallelismChange.getNewParallelism(),
+                                                metrics));
                             }
                         });
+
+        // If the Utilization of all required tasks is within range, we can skip scaling.
+        // It means that if only optional tasks are out of scope, we still need to ignore scale.
+        if (allRequiredVerticesWithinUtilizationTarget(
+                evaluatedMetrics.getVertexMetrics(), requiredVertices)) {
+            return Map.of();
+        }
+
         return out;
     }
 
@@ -242,7 +300,7 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
             return true;
         }
 
-        var heapUsage = evaluatedMetrics.get(ScalingMetric.HEAP_USAGE).getAverage();
+        var heapUsage = evaluatedMetrics.get(ScalingMetric.HEAP_MAX_USAGE_RATIO).getAverage();
         if (heapUsage > conf.get(AutoScalerOptions.HEAP_USAGE_THRESHOLD)) {
             autoScalerEventHandler.handleEvent(
                     ctx,
@@ -257,17 +315,40 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
         return false;
     }
 
+    @VisibleForTesting
+    protected boolean scalingWouldExceedMaxResources(
+            Configuration tunedConfig,
+            JobTopology jobTopology,
+            EvaluatedMetrics evaluatedMetrics,
+            Map<JobVertexID, ScalingSummary> scalingSummaries,
+            Context ctx) {
+        if (scalingWouldExceedClusterResources(
+                tunedConfig, evaluatedMetrics, scalingSummaries, ctx)) {
+            return true;
+        }
+        if (scalingWouldExceedResourceQuota(tunedConfig, jobTopology, scalingSummaries, ctx)) {
+            autoScalerEventHandler.handleEvent(
+                    ctx,
+                    AutoScalerEventHandler.Type.Warning,
+                    "ResourceQuotaReached",
+                    RESOURCE_QUOTA_REACHED_MESSAGE,
+                    null,
+                    tunedConfig.get(SCALING_EVENT_INTERVAL));
+            return true;
+        }
+        return false;
+    }
+
     private boolean scalingWouldExceedClusterResources(
+            Configuration tunedConfig,
             EvaluatedMetrics evaluatedMetrics,
             Map<JobVertexID, ScalingSummary> scalingSummaries,
             JobAutoScalerContext<?> ctx) {
 
-        final double taskManagerCpu = ctx.getTaskManagerCpu();
-        final MemorySize taskManagerMemory = ctx.getTaskManagerMemory();
+        final double taskManagerCpu = ctx.getTaskManagerCpu().orElse(0.);
+        final MemorySize taskManagerMemory = MemoryTuning.getTotalMemory(tunedConfig, ctx);
 
-        if (taskManagerCpu <= 0
-                || taskManagerMemory == null
-                || taskManagerMemory.compareTo(MemorySize.ZERO) <= 0) {
+        if (taskManagerCpu <= 0 || taskManagerMemory.compareTo(MemorySize.ZERO) <= 0) {
             // We can't extract the requirements, we can't make any assumptions
             return false;
         }
@@ -278,46 +359,96 @@ public class ScalingExecutor<KEY, Context extends JobAutoScalerContext<KEY>> {
             return true;
         }
 
-        var vertexMetrics = evaluatedMetrics.getVertexMetrics();
+        int numTaskSlotsUsed =
+                (int) globalMetrics.get(ScalingMetric.NUM_TASK_SLOTS_USED).getCurrent();
+        final int numTaskSlotsAfterRescale =
+                ResourceCheckUtils.estimateNumTaskSlotsAfterRescale(
+                        evaluatedMetrics.getVertexMetrics(), scalingSummaries, numTaskSlotsUsed);
 
-        int oldParallelismSum =
-                vertexMetrics.values().stream()
-                        .map(map -> (int) map.get(ScalingMetric.PARALLELISM).getCurrent())
-                        .reduce(0, Integer::sum);
-
-        Map<JobVertexID, Integer> newParallelisms = new HashMap<>();
-        for (Map.Entry<JobVertexID, Map<ScalingMetric, EvaluatedScalingMetric>> entry :
-                vertexMetrics.entrySet()) {
-            JobVertexID jobVertexID = entry.getKey();
-            ScalingSummary scalingSummary = scalingSummaries.get(jobVertexID);
-            if (scalingSummary != null) {
-                newParallelisms.put(jobVertexID, scalingSummary.getNewParallelism());
-            } else {
-                newParallelisms.put(
-                        jobVertexID,
-                        (int) entry.getValue().get(ScalingMetric.PARALLELISM).getCurrent());
-            }
-        }
-
-        double numTaskSlotsUsed = globalMetrics.get(ScalingMetric.NUM_TASK_SLOTS_USED).getCurrent();
-
-        final int numTaskSlotsAfterRescale;
-        if (oldParallelismSum >= numTaskSlotsUsed) {
-            // Slot sharing is (partially) deactivated,
-            // assuming no slot sharing in absence of additional data.
-            numTaskSlotsAfterRescale = newParallelisms.values().stream().reduce(0, Integer::sum);
-        } else {
-            // Slot sharing is activated
-            numTaskSlotsAfterRescale = newParallelisms.values().stream().reduce(0, Integer::max);
-        }
-
-        int taskSlotsPerTm = ctx.getConfiguration().get(TaskManagerOptions.NUM_TASK_SLOTS);
+        int taskSlotsPerTm = tunedConfig.get(TaskManagerOptions.NUM_TASK_SLOTS);
 
         int currentNumTms = (int) Math.ceil(numTaskSlotsUsed / (double) taskSlotsPerTm);
         int newNumTms = (int) Math.ceil(numTaskSlotsAfterRescale / (double) taskSlotsPerTm);
 
         return !resourceCheck.trySchedule(
                 currentNumTms, newNumTms, taskManagerCpu, taskManagerMemory);
+    }
+
+    protected static boolean scalingWouldExceedResourceQuota(
+            Configuration tunedConfig,
+            JobTopology jobTopology,
+            Map<JobVertexID, ScalingSummary> scalingSummaries,
+            JobAutoScalerContext<?> ctx) {
+
+        if (jobTopology == null || jobTopology.getSlotSharingGroupMapping().isEmpty()) {
+            return false;
+        }
+
+        var cpuQuota = tunedConfig.getOptional(AutoScalerOptions.CPU_QUOTA);
+        var memoryQuota = tunedConfig.getOptional(AutoScalerOptions.MEMORY_QUOTA);
+        var tmMemory = MemoryTuning.getTotalMemory(tunedConfig, ctx);
+        var tmCpu = ctx.getTaskManagerCpu().orElse(0.);
+
+        if (cpuQuota.isPresent() || memoryQuota.isPresent()) {
+            var currentSlotSharingGroupMaxParallelisms = new HashMap<SlotSharingGroupId, Integer>();
+            var newSlotSharingGroupMaxParallelisms = new HashMap<SlotSharingGroupId, Integer>();
+            for (var e : jobTopology.getSlotSharingGroupMapping().entrySet()) {
+                int currentMaxParallelism =
+                        e.getValue().stream()
+                                .filter(scalingSummaries::containsKey)
+                                .mapToInt(v -> scalingSummaries.get(v).getCurrentParallelism())
+                                .max()
+                                .orElse(0);
+                currentSlotSharingGroupMaxParallelisms.put(e.getKey(), currentMaxParallelism);
+                int newMaxParallelism =
+                        e.getValue().stream()
+                                .filter(scalingSummaries::containsKey)
+                                .mapToInt(v -> scalingSummaries.get(v).getNewParallelism())
+                                .max()
+                                .orElse(0);
+                newSlotSharingGroupMaxParallelisms.put(e.getKey(), newMaxParallelism);
+            }
+
+            var numSlotsPerTm = tunedConfig.get(TaskManagerOptions.NUM_TASK_SLOTS);
+            var currentTotalSlots =
+                    currentSlotSharingGroupMaxParallelisms.values().stream()
+                            .mapToInt(Integer::intValue)
+                            .sum();
+            var currentNumTms = currentTotalSlots / numSlotsPerTm;
+            var newTotalSlots =
+                    newSlotSharingGroupMaxParallelisms.values().stream()
+                            .mapToInt(Integer::intValue)
+                            .sum();
+            var newNumTms = newTotalSlots / numSlotsPerTm;
+
+            if (newNumTms <= currentNumTms) {
+                LOG.debug(
+                        "Skipping quota check due to new resource allocation is less or equals than the current");
+                return false;
+            }
+
+            if (cpuQuota.isPresent()) {
+                LOG.debug("CPU resource quota is {}, checking limits", cpuQuota.get());
+                double totalCPU = tmCpu * newNumTms;
+                if (totalCPU > cpuQuota.get()) {
+                    LOG.info("CPU resource quota reached with value: {}", totalCPU);
+                    return true;
+                }
+            }
+
+            if (memoryQuota.isPresent()) {
+                LOG.debug("Memory resource quota is {}, checking limits", memoryQuota.get());
+                long totalMemory = tmMemory.getBytes() * newNumTms;
+                if (totalMemory > memoryQuota.get().getBytes()) {
+                    LOG.info(
+                            "Memory resource quota reached with value: {}",
+                            new MemorySize(totalMemory));
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private static Map<String, String> getVertexParallelismOverrides(

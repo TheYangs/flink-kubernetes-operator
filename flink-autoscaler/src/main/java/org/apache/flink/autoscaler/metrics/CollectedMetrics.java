@@ -31,6 +31,5 @@ import java.util.Map;
 @AllArgsConstructor
 public class CollectedMetrics {
     private Map<JobVertexID, Map<ScalingMetric, Double>> vertexMetrics;
-    private Map<Edge, Double> outputRatios;
     private Map<ScalingMetric, Double> globalMetrics;
 }

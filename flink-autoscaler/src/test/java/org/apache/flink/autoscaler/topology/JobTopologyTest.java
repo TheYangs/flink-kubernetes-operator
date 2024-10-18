@@ -23,13 +23,18 @@ import org.apache.flink.runtime.jobgraph.jsonplan.JsonPlanGenerator;
 import org.apache.flink.runtime.scheduler.SchedulerBase;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
+
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Set;
+import java.util.Map;
 
+import static org.apache.flink.autoscaler.topology.ShipStrategy.FORWARD;
+import static org.apache.flink.autoscaler.topology.ShipStrategy.HASH;
+import static org.apache.flink.autoscaler.topology.ShipStrategy.REBALANCE;
+import static org.apache.flink.autoscaler.topology.ShipStrategy.RESCALE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -43,17 +48,17 @@ public class JobTopologyTest {
         var s2 = env.fromElements(1).name("s2");
 
         s1.union(s2)
-                .shuffle()
+                .keyBy(v -> v)
                 .map(i -> i)
                 .name("map1")
                 .setParallelism(2)
-                .shuffle()
                 .print()
+                .disableChaining()
                 .name("sink1")
-                .setParallelism(3);
+                .setParallelism(2);
 
         var s3 = env.fromElements(1).name("s3");
-        var map2 = s3.shuffle().map(i -> i).name("map2").setParallelism(4).shuffle();
+        var map2 = s3.rescale().map(i -> i).name("map2").setParallelism(4).rebalance();
 
         map2.print().name("sink2").setParallelism(5);
         map2.print().name("sink3").setParallelism(6);
@@ -73,28 +78,37 @@ public class JobTopologyTest {
         }
 
         JobTopology jobTopology =
-                JobTopology.fromJsonPlan(jsonPlan, maxParallelism, Collections.emptySet());
+                JobTopology.fromJsonPlan(
+                        jsonPlan, Map.of(), maxParallelism, Map.of(), Collections.emptySet());
 
-        assertTrue(jobTopology.getOutputs().get(vertices.get("Sink: sink1")).isEmpty());
-        assertTrue(jobTopology.getOutputs().get(vertices.get("Sink: sink2")).isEmpty());
-        assertTrue(jobTopology.getOutputs().get(vertices.get("Sink: sink3")).isEmpty());
-
-        assertEquals(
-                Set.of(vertices.get("map1")),
-                jobTopology.getOutputs().get(vertices.get("Source: s1")));
-        assertEquals(
-                Set.of(vertices.get("map1")),
-                jobTopology.getOutputs().get(vertices.get("Source: s2")));
-        assertEquals(
-                Set.of(vertices.get("map2")),
-                jobTopology.getOutputs().get(vertices.get("Source: s3")));
+        assertTrue(jobTopology.get(vertices.get("Sink: sink1")).getOutputs().isEmpty());
+        assertTrue(jobTopology.get(vertices.get("Sink: sink2")).getOutputs().isEmpty());
+        assertTrue(jobTopology.get(vertices.get("Sink: sink3")).getOutputs().isEmpty());
 
         assertEquals(
-                Set.of(vertices.get("Sink: sink2"), vertices.get("Sink: sink3")),
-                jobTopology.getOutputs().get(vertices.get("map2")));
+                Map.of(vertices.get("map1"), HASH),
+                jobTopology.get(vertices.get("Source: s1")).getOutputs());
+        assertEquals(
+                Map.of(vertices.get("map1"), HASH),
+                jobTopology.get(vertices.get("Source: s2")).getOutputs());
+        assertEquals(
+                Map.of(vertices.get("Sink: sink1"), FORWARD),
+                jobTopology.get(vertices.get("map1")).getOutputs());
 
-        assertEquals(2, jobTopology.getParallelisms().get(vertices.get("map1")));
-        assertEquals(4, jobTopology.getParallelisms().get(vertices.get("map2")));
-        jobTopology.getMaxParallelisms().forEach((v, p) -> assertEquals(128, p));
+        assertEquals(
+                Map.of(vertices.get("map2"), RESCALE),
+                jobTopology.get(vertices.get("Source: s3")).getOutputs());
+
+        assertEquals(
+                Map.of(
+                        vertices.get("Sink: sink2"),
+                        REBALANCE,
+                        vertices.get("Sink: sink3"),
+                        REBALANCE),
+                jobTopology.get(vertices.get("map2")).getOutputs());
+
+        assertEquals(2, jobTopology.get(vertices.get("map1")).getParallelism());
+        assertEquals(4, jobTopology.get(vertices.get("map2")).getParallelism());
+        jobTopology.getVertexInfos().forEach((v, p) -> assertEquals(128, p.getMaxParallelism()));
     }
 }

@@ -23,16 +23,23 @@ import org.apache.flink.annotation.Experimental;
 /** Enumeration for supported Flink versions. */
 @Experimental
 public enum FlinkVersion {
+    /** No longer supported since 1.7 operator release. */
+    @Deprecated
     v1_13,
+    /** No longer supported since 1.7 operator release. */
+    @Deprecated
     v1_14,
+    /** Deprecated since 1.10 operator release. */
+    @Deprecated
     v1_15,
     v1_16,
     v1_17,
     v1_18,
-    v1_19;
+    v1_19,
+    v1_20;
 
-    public boolean isNewerVersionThan(FlinkVersion otherVersion) {
-        return this.ordinal() > otherVersion.ordinal();
+    public boolean isEqualOrNewer(FlinkVersion otherVersion) {
+        return this.ordinal() >= otherVersion.ordinal();
     }
 
     /**
@@ -45,6 +52,6 @@ public enum FlinkVersion {
     }
 
     public static boolean isSupported(FlinkVersion version) {
-        return version != null && version.isNewerVersionThan(FlinkVersion.v1_14);
+        return version != null && version.isEqualOrNewer(FlinkVersion.v1_15);
     }
 }

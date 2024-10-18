@@ -23,7 +23,7 @@ under the License.
     <parent>
         <groupId>org.apache.flink</groupId>
         <artifactId>flink-kubernetes-operator-parent</artifactId>
-        <version>1.8-SNAPSHOT</version>
+        <version>1.11-SNAPSHOT</version>
         <relativePath>..</relativePath>
     </parent>
 
@@ -32,12 +32,13 @@ under the License.
     <packaging>jar</packaging>
 
     <properties>
-        <awaitility.version>4.1.0</awaitility.version>
         <plugins.tmp.dir>${project.build.directory}/plugins</plugins.tmp.dir>
         <surefire.module.config>
             <!-- required by FlinkConfigManagerTest -->
             --add-opens=java.base/java.util=ALL-UNNAMED
         </surefire.module.config>
+        <!-- valid options can be checked at https://central.sonatype.com/search?q=kubernetes-httpclient- currently: okhttp, jdk, jetty, vertx -->
+        <fabric8.httpclient.impl>okhttp</fabric8.httpclient.impl>
     </properties>
 
     <dependencies>
@@ -45,6 +46,12 @@ under the License.
             <groupId>io.javaoperatorsdk</groupId>
             <artifactId>operator-framework</artifactId>
             <version>${operator.sdk.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.fabric8</groupId>
+                    <artifactId>kubernetes-httpclient-okhttp</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>
@@ -60,25 +67,16 @@ under the License.
         </dependency>
 
         <dependency>
+            <!-- https://github.com/fabric8io/kubernetes-client/blob/main/doc/FAQ.md#what-artifacts-should-my-project-depend-on-->
             <groupId>io.fabric8</groupId>
-            <artifactId>kubernetes-httpclient-okhttp</artifactId>
+            <artifactId>kubernetes-httpclient-${fabric8.httpclient.impl}</artifactId>
             <version>${fabric8.version}</version>
             <exclusions>
                 <exclusion>
                     <groupId>com.squareup.okhttp3</groupId>
-                    <artifactId>*</artifactId>
+                    <artifactId>okhttp</artifactId>
                 </exclusion>
             </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>com.squareup.okhttp3</groupId>
-            <artifactId>okhttp</artifactId>
-            <version>${okhttp.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.squareup.okhttp3</groupId>
-            <artifactId>logging-interceptor</artifactId>
-            <version>${okhttp.version}</version>
         </dependency>
 
         <!-- Flink -->
@@ -174,6 +172,12 @@ under the License.
             <artifactId>kubernetes-server-mock</artifactId>
             <version>${fabric8.version}</version>
             <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.squareup.okhttp3</groupId>
+                    <artifactId>mockwebserver</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>
@@ -200,6 +204,10 @@ under the License.
                 <exclusion>
                     <groupId>org.junit.jupiter</groupId>
                     <artifactId>*</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>log4j</groupId>
+                    <artifactId>log4j</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>
@@ -249,6 +257,12 @@ under the License.
                                     <artifact>*:*</artifact>
                                     <excludes>
                                         <exclude>META-INF/**/module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                                <filter>
+                                    <artifact>org.apache.flink:flink-kubernetes</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/versions/**/com/fasterxml/jackson/core/io/doubleparser/**</exclude>
                                     </excludes>
                                 </filter>
                             </filters>
@@ -406,6 +420,22 @@ under the License.
                     </plugin>
                 </plugins>
             </build>
+        </profile>
+        <profile>
+            <id>depend-on-okhttp4</id>
+            <activation>
+                <property>
+                    <name>fabric8.httpclient.impl</name>
+                    <value>okhttp</value>
+                </property>
+            </activation>
+            <dependencies>
+                <dependency>
+                    <groupId>com.squareup.okhttp3</groupId>
+                    <artifactId>okhttp</artifactId>
+                    <version>${okhttp.version}</version>
+                </dependency>
+            </dependencies>
         </profile>
     </profiles>
 

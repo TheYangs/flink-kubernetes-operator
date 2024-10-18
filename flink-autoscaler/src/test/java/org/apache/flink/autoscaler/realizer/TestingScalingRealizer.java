@@ -18,6 +18,9 @@
 package org.apache.flink.autoscaler.realizer;
 
 import org.apache.flink.autoscaler.JobAutoScalerContext;
+import org.apache.flink.autoscaler.tuning.ConfigChanges;
+
+import lombok.Getter;
 
 import java.util.LinkedList;
 import java.util.Map;
@@ -29,28 +32,45 @@ public class TestingScalingRealizer<KEY, Context extends JobAutoScalerContext<KE
     public final LinkedList<Event<KEY, Context>> events = new LinkedList<>();
 
     @Override
-    public void realize(Context context, Map<String, String> parallelismOverrides) {
+    public void realizeParallelismOverrides(
+            Context context, Map<String, String> parallelismOverrides) {
         events.add(new Event<>(context, parallelismOverrides));
+    }
+
+    @Override
+    public void realizeConfigOverrides(Context context, ConfigChanges configChanges) {
+        events.add(new Event<>(context, configChanges));
     }
 
     /** The collected event. */
     public static class Event<KEY, Context extends JobAutoScalerContext<KEY>> {
 
-        private final Context context;
+        @Getter private final Context context;
 
-        private final Map<String, String> parallelismOverrides;
+        @Getter private Map<String, String> parallelismOverrides;
+
+        @Getter private ConfigChanges configChanges;
 
         public Event(Context context, Map<String, String> parallelismOverrides) {
             this.context = context;
             this.parallelismOverrides = parallelismOverrides;
         }
 
-        public Context getContext() {
-            return context;
+        public Event(Context context, ConfigChanges configChanges) {
+            this.context = context;
+            this.configChanges = configChanges;
         }
 
-        public Map<String, String> getParallelismOverrides() {
-            return parallelismOverrides;
+        @Override
+        public String toString() {
+            return "Event{"
+                    + "context="
+                    + context
+                    + ", parallelismOverrides="
+                    + parallelismOverrides
+                    + ", configOverrides="
+                    + configChanges
+                    + '}';
         }
     }
 }

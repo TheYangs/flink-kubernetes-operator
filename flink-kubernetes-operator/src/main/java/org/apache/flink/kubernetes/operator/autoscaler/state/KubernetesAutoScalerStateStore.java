@@ -18,27 +18,33 @@
 package org.apache.flink.kubernetes.operator.autoscaler.state;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.autoscaler.DelayedScaleDown;
 import org.apache.flink.autoscaler.ScalingSummary;
 import org.apache.flink.autoscaler.ScalingTracking;
 import org.apache.flink.autoscaler.metrics.CollectedMetrics;
 import org.apache.flink.autoscaler.state.AutoScalerStateStore;
+import org.apache.flink.autoscaler.tuning.ConfigChanges;
 import org.apache.flink.autoscaler.utils.AutoScalerSerDeModule;
 import org.apache.flink.configuration.ConfigurationUtils;
 import org.apache.flink.kubernetes.operator.autoscaler.KubernetesJobAutoScalerContext;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
-import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.core.JacksonException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonInclude;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JacksonException;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.type.TypeReference;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.apache.flink.shaded.jackson2.org.yaml.snakeyaml.LoaderOptions;
+
 import io.javaoperatorsdk.operator.processing.event.ResourceID;
 import lombok.SneakyThrows;
 import org.apache.commons.io.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yaml.snakeyaml.LoaderOptions;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -65,7 +71,12 @@ public class KubernetesAutoScalerStateStore
     @VisibleForTesting protected static final String COLLECTED_METRICS_KEY = "collectedMetrics";
 
     @VisibleForTesting
+    /* Be careful with changing this field name or the internal structure. Otherwise the parallelism of all autoscaled pipelines might get reset! */
     protected static final String PARALLELISM_OVERRIDES_KEY = "parallelismOverrides";
+
+    protected static final String CONFIG_OVERRIDES_KEY = "configOverrides";
+
+    @VisibleForTesting protected static final String DELAYED_SCALE_DOWN = "delayedScaleDown";
 
     @VisibleForTesting protected static final int MAX_CM_BYTES = 1000000;
 
@@ -96,6 +107,7 @@ public class KubernetesAutoScalerStateStore
                 jobContext, SCALING_TRACKING_KEY, serializeScalingTracking(scalingTrack));
     }
 
+    @Nonnull
     @Override
     public Map<JobVertexID, SortedMap<Instant, ScalingSummary>> getScalingHistory(
             KubernetesJobAutoScalerContext jobContext) {
@@ -146,6 +158,7 @@ public class KubernetesAutoScalerStateStore
                 jobContext, COLLECTED_METRICS_KEY, serializeEvaluatedMetrics(metrics));
     }
 
+    @Nonnull
     @Override
     public SortedMap<Instant, CollectedMetrics> getCollectedMetrics(
             KubernetesJobAutoScalerContext jobContext) {
@@ -179,6 +192,7 @@ public class KubernetesAutoScalerStateStore
                 serializeParallelismOverrides(parallelismOverrides));
     }
 
+    @Nonnull
     @Override
     public Map<String, String> getParallelismOverrides(KubernetesJobAutoScalerContext jobContext) {
         return configMapStore
@@ -187,9 +201,58 @@ public class KubernetesAutoScalerStateStore
                 .orElse(new HashMap<>());
     }
 
+    @Nonnull
+    @Override
+    public ConfigChanges getConfigChanges(KubernetesJobAutoScalerContext jobContext) {
+        return configMapStore
+                .getSerializedState(jobContext, CONFIG_OVERRIDES_KEY)
+                .map(KubernetesAutoScalerStateStore::deserializeConfigOverrides)
+                .orElse(new ConfigChanges());
+    }
+
+    @Override
+    public void storeConfigChanges(
+            KubernetesJobAutoScalerContext jobContext, ConfigChanges overrides) {
+        configMapStore.putSerializedState(
+                jobContext, CONFIG_OVERRIDES_KEY, serializeConfigOverrides(overrides));
+    }
+
+    @Override
+    public void removeConfigChanges(KubernetesJobAutoScalerContext jobContext) {
+        configMapStore.removeSerializedState(jobContext, CONFIG_OVERRIDES_KEY);
+    }
+
     @Override
     public void removeParallelismOverrides(KubernetesJobAutoScalerContext jobContext) {
         configMapStore.removeSerializedState(jobContext, PARALLELISM_OVERRIDES_KEY);
+    }
+
+    @Override
+    public void storeDelayedScaleDown(
+            KubernetesJobAutoScalerContext jobContext, DelayedScaleDown delayedScaleDown)
+            throws Exception {
+        configMapStore.putSerializedState(
+                jobContext, DELAYED_SCALE_DOWN, serializeDelayedScaleDown(delayedScaleDown));
+    }
+
+    @Nonnull
+    @Override
+    public DelayedScaleDown getDelayedScaleDown(KubernetesJobAutoScalerContext jobContext) {
+        Optional<String> delayedScaleDown =
+                configMapStore.getSerializedState(jobContext, DELAYED_SCALE_DOWN);
+        if (delayedScaleDown.isEmpty()) {
+            return new DelayedScaleDown();
+        }
+
+        try {
+            return deserializeDelayedScaleDown(delayedScaleDown.get());
+        } catch (JacksonException e) {
+            LOG.error(
+                    "Could not deserialize delayed scale down, possibly the format changed. Discarding...",
+                    e);
+            configMapStore.removeSerializedState(jobContext, DELAYED_SCALE_DOWN);
+            return new DelayedScaleDown();
+        }
     }
 
     @Override
@@ -247,6 +310,38 @@ public class KubernetesAutoScalerStateStore
 
     private static Map<String, String> deserializeParallelismOverrides(String overrides) {
         return ConfigurationUtils.convertValue(overrides, Map.class);
+    }
+
+    @Nullable
+    private static String serializeConfigOverrides(ConfigChanges configChanges) {
+        try {
+            return YAML_MAPPER.writeValueAsString(configChanges);
+        } catch (Exception e) {
+            LOG.error("Failed to serialize ConfigOverrides", e);
+            return null;
+        }
+    }
+
+    @Nullable
+    private static ConfigChanges deserializeConfigOverrides(String configOverrides) {
+        try {
+            return YAML_MAPPER.readValue(configOverrides, new TypeReference<>() {});
+        } catch (Exception e) {
+            LOG.error("Failed to deserialize ConfigOverrides", e);
+            return null;
+        }
+    }
+
+    private static String serializeDelayedScaleDown(DelayedScaleDown delayedScaleDown)
+            throws JacksonException {
+        return YAML_MAPPER.writeValueAsString(delayedScaleDown.getFirstTriggerTime());
+    }
+
+    private static DelayedScaleDown deserializeDelayedScaleDown(String delayedScaleDown)
+            throws JacksonException {
+        Map<JobVertexID, Instant> firstTriggerTime =
+                YAML_MAPPER.readValue(delayedScaleDown, new TypeReference<>() {});
+        return new DelayedScaleDown(firstTriggerTime);
     }
 
     @VisibleForTesting

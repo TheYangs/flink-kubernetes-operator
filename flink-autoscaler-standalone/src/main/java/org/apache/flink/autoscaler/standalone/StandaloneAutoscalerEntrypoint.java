@@ -18,6 +18,7 @@
 package org.apache.flink.autoscaler.standalone;
 
 import org.apache.flink.annotation.Experimental;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.autoscaler.JobAutoScaler;
 import org.apache.flink.autoscaler.JobAutoScalerContext;
@@ -26,12 +27,12 @@ import org.apache.flink.autoscaler.RestApiMetricsCollector;
 import org.apache.flink.autoscaler.ScalingExecutor;
 import org.apache.flink.autoscaler.ScalingMetricEvaluator;
 import org.apache.flink.autoscaler.event.AutoScalerEventHandler;
-import org.apache.flink.autoscaler.event.LoggingEventHandler;
 import org.apache.flink.autoscaler.standalone.flinkcluster.FlinkClusterJobListFetcher;
 import org.apache.flink.autoscaler.standalone.realizer.RescaleApiScalingRealizer;
 import org.apache.flink.autoscaler.state.AutoScalerStateStore;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.GlobalConfiguration;
 import org.apache.flink.runtime.highavailability.nonha.standalone.StandaloneClientHAServices;
 
 import org.slf4j.Logger;
@@ -49,14 +50,16 @@ public class StandaloneAutoscalerEntrypoint {
 
     public static <KEY, Context extends JobAutoScalerContext<KEY>> void main(String[] args)
             throws Exception {
-        var conf = ParameterTool.fromArgs(args).getConfiguration();
+        var conf = loadConfiguration(args);
         LOG.info("The standalone autoscaler is started, configuration: {}", conf);
 
         // Initialize JobListFetcher and JobAutoScaler.
-        var eventHandler = new LoggingEventHandler<KEY, Context>();
         JobListFetcher<KEY, Context> jobListFetcher = createJobListFetcher(conf);
 
         AutoScalerStateStore<KEY, Context> stateStore = AutoscalerStateStoreFactory.create(conf);
+        AutoScalerEventHandler<KEY, Context> eventHandler =
+                AutoscalerEventHandlerFactory.create(conf);
+
         var autoScaler = createJobAutoscaler(eventHandler, stateStore);
 
         var autoscalerExecutor =
@@ -92,5 +95,11 @@ public class StandaloneAutoscalerEntrypoint {
                 eventHandler,
                 new RescaleApiScalingRealizer<>(eventHandler),
                 stateStore);
+    }
+
+    @VisibleForTesting
+    static Configuration loadConfiguration(String[] args) {
+        return GlobalConfiguration.loadConfiguration(
+                ParameterTool.fromArgs(args).getConfiguration());
     }
 }

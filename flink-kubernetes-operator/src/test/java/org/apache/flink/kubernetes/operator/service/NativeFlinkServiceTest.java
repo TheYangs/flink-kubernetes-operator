@@ -18,6 +18,7 @@
 package org.apache.flink.kubernetes.operator.service;
 
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -30,38 +31,37 @@ import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
-import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkDeploymentContext;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
-import org.apache.flink.kubernetes.operator.utils.EventCollector;
 import org.apache.flink.kubernetes.operator.utils.EventRecorder;
-import org.apache.flink.runtime.execution.ExecutionState;
+import org.apache.flink.kubernetes.operator.utils.FlinkResourceEventCollector;
+import org.apache.flink.kubernetes.operator.utils.FlinkStateSnapshotEventCollector;
+import org.apache.flink.kubernetes.utils.KubernetesUtils;
 import org.apache.flink.runtime.jobgraph.JobResourceRequirements;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexResourceRequirements;
-import org.apache.flink.runtime.rest.messages.EmptyResponseBody;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
-import org.apache.flink.runtime.rest.messages.JobPlanInfo;
-import org.apache.flink.runtime.rest.messages.job.JobDetailsHeaders;
-import org.apache.flink.runtime.rest.messages.job.JobDetailsInfo;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsBody;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsHeaders;
-import org.apache.flink.runtime.rest.messages.job.metrics.IOMetricsInfo;
 import org.apache.flink.util.concurrent.Executors;
 
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
+import io.fabric8.kubernetes.api.model.PodBuilder;
 import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
+import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
-import java.util.List;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -74,7 +74,6 @@ import static org.apache.flink.kubernetes.operator.config.FlinkConfigBuilder.FLI
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_HEALTH_PROBE_PORT;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -85,10 +84,14 @@ import static org.junit.jupiter.api.Assertions.fail;
 @EnableKubernetesMockClient(crud = true)
 public class NativeFlinkServiceTest {
     KubernetesClient client;
+    KubernetesMockServer mockServer;
     private final Configuration configuration = new Configuration();
-    private final FlinkConfigManager configManager = new FlinkConfigManager(configuration);
+    private FlinkConfigManager configManager;
 
-    private final EventCollector eventCollector = new EventCollector();
+    private final FlinkResourceEventCollector flinkResourceEventCollector =
+            new FlinkResourceEventCollector();
+    private final FlinkStateSnapshotEventCollector flinkStateSnapshotEventCollector =
+            new FlinkStateSnapshotEventCollector();
 
     private EventRecorder eventRecorder;
     private FlinkOperatorConfiguration operatorConfig;
@@ -96,19 +99,32 @@ public class NativeFlinkServiceTest {
 
     @BeforeEach
     public void setup() {
+        configManager = new FlinkConfigManager(configuration);
         configuration.set(KubernetesConfigOptions.CLUSTER_ID, TestUtils.TEST_DEPLOYMENT_NAME);
         configuration.set(KubernetesConfigOptions.NAMESPACE, TestUtils.TEST_NAMESPACE);
-        configuration.set(FLINK_VERSION, FlinkVersion.v1_15);
-        eventRecorder = new EventRecorder(eventCollector);
+        configuration.set(FLINK_VERSION, FlinkVersion.v1_20);
+        eventRecorder =
+                new EventRecorder(flinkResourceEventCollector, flinkStateSnapshotEventCollector);
         operatorConfig = FlinkOperatorConfiguration.fromConfiguration(configuration);
         executorService = Executors.newDirectExecutorService();
     }
 
-    @Test
-    public void testDeleteClusterInternal() {
+    @ParameterizedTest
+    @EnumSource(DeletionPropagation.class)
+    public void testDeleteClusterInternal(DeletionPropagation propagation) {
+        var timeout = Duration.ofSeconds(4);
+        configuration.set(
+                KubernetesOperatorConfigOptions.OPERATOR_RESOURCE_CLEANUP_TIMEOUT, timeout);
+        var flinkService =
+                new NativeFlinkService(
+                        client,
+                        null,
+                        executorService,
+                        FlinkOperatorConfiguration.fromConfiguration(configuration),
+                        eventRecorder);
+
         var deployment = TestUtils.buildApplicationCluster();
         ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
-        var flinkService = createFlinkService(null);
 
         var dep =
                 new DeploymentBuilder()
@@ -117,22 +133,60 @@ public class NativeFlinkServiceTest {
                         .withNamespace(TestUtils.TEST_NAMESPACE)
                         .endMetadata()
                         .withNewSpec()
+                        .withReplicas(1)
                         .endSpec()
                         .build();
         client.resource(dep).create();
 
-        assertNotNull(
-                client.apps()
-                        .deployments()
-                        .inNamespace(TestUtils.TEST_NAMESPACE)
-                        .withName(TestUtils.TEST_DEPLOYMENT_NAME)
-                        .get());
+        var patched = new AtomicBoolean(false);
+        mockServer
+                .expect()
+                .patch()
+                .withPath(
+                        String.format(
+                                "/apis/apps/v1/namespaces/%s/deployments/%s",
+                                TestUtils.TEST_NAMESPACE, TestUtils.TEST_DEPLOYMENT_NAME))
+                .andReply(
+                        200,
+                        req -> {
+                            patched.set(true);
+                            return deployment;
+                        })
+                .always();
 
+        // We create the JM pod explicitly here, this will block the JM scale down action
+        // indefinitely and we use this to verify the correct timeout enforcement
+        var jmPod =
+                new PodBuilder()
+                        .withNewMetadata()
+                        .withName("JM")
+                        .withLabels(
+                                KubernetesUtils.getJobManagerSelectors(
+                                        TestUtils.TEST_DEPLOYMENT_NAME))
+                        .withNamespace(TestUtils.TEST_NAMESPACE)
+                        .endMetadata()
+                        .build();
+        client.resource(jmPod).create();
+
+        var start = Instant.now();
         flinkService.deleteClusterInternal(
-                deployment.getMetadata(),
+                deployment.getMetadata().getNamespace(),
+                deployment.getMetadata().getName(),
                 configManager.getObserveConfig(deployment),
-                false,
-                DeletionPropagation.FOREGROUND);
+                propagation);
+        var measured = Duration.between(start, Instant.now());
+
+        // Do not scale JM deployment during orphan deletion
+        if (propagation == DeletionPropagation.FOREGROUND) {
+            assertTrue(patched.get());
+            // We make sure that we dont use up the entire timeout for jm deletion
+            assertTrue(timeout.minus(measured).toSeconds() > 0);
+            // Validate that we actually waited 2 seconds
+            assertTrue(measured.toSeconds() > 1);
+        } else {
+            assertFalse(patched.get());
+        }
+
         assertNull(
                 client.apps()
                         .deployments()
@@ -149,19 +203,20 @@ public class NativeFlinkServiceTest {
                 new NativeFlinkService(
                         client, null, executorService, operatorConfig, eventRecorder) {
                     @Override
-                    protected void cancelJob(
+                    protected CancelResult cancelJob(
                             FlinkDeployment deployment,
-                            UpgradeMode upgradeMode,
+                            SuspendMode upgradeMode,
                             Configuration conf,
-                            boolean deleteClusterAfterSavepoint) {
-                        assertEquals(false, deleteClusterAfterSavepoint);
+                            boolean deleteCluster) {
+                        assertFalse(deleteCluster);
                         tested.set(true);
+                        return CancelResult.completed(null);
                     }
                 };
 
         flinkService.cancelJob(
                 TestUtils.buildApplicationCluster(flinkVersion),
-                UpgradeMode.SAVEPOINT,
+                SuspendMode.SAVEPOINT,
                 new Configuration());
         assertTrue(tested.get());
     }
@@ -229,10 +284,12 @@ public class NativeFlinkServiceTest {
         var reconStatus = flinkDep.getStatus().getReconciliationStatus();
         reconStatus.serializeAndSetLastReconciledSpec(spec, flinkDep);
 
-        appConfig.set(PipelineOptions.PARALLELISM_OVERRIDES, Map.of(v1.toHexString(), "4"));
+        appConfig.set(
+                PipelineOptions.PARALLELISM_OVERRIDES,
+                Map.of(v1.toHexString(), "4", v2.toHexString(), "1"));
         spec.setFlinkConfiguration(appConfig.toMap());
 
-        flinkDep.getStatus().getJobStatus().setState("RUNNING");
+        flinkDep.getStatus().getJobStatus().setState(JobStatus.RUNNING);
 
         current.set(
                 Map.of(
@@ -242,8 +299,7 @@ public class NativeFlinkServiceTest {
                         v2,
                                 new JobVertexResourceRequirements(
                                         new JobVertexResourceRequirements.Parallelism(2, 2))));
-        assertEquals(
-                FlinkService.ScalingResult.SCALING_TRIGGERED,
+        assertTrue(
                 service.scale(
                         new FlinkDeploymentContext(
                                 flinkDep,
@@ -256,17 +312,17 @@ public class NativeFlinkServiceTest {
                 Map.of(
                         v1,
                                 new JobVertexResourceRequirements(
-                                        new JobVertexResourceRequirements.Parallelism(4, 4)),
+                                        new JobVertexResourceRequirements.Parallelism(1, 4)),
                         v2,
                                 new JobVertexResourceRequirements(
-                                        new JobVertexResourceRequirements.Parallelism(2, 2))),
+                                        new JobVertexResourceRequirements.Parallelism(1, 1))),
                 updated.get());
 
         // Baseline
-        testScaleConditionDep(
-                flinkDep, service, d -> {}, FlinkService.ScalingResult.SCALING_TRIGGERED);
-        testScaleConditionLastSpec(
-                flinkDep, service, d -> {}, FlinkService.ScalingResult.SCALING_TRIGGERED);
+        appConfig.set(PipelineOptions.PARALLELISM_OVERRIDES, Map.of(v1.toHexString(), "4"));
+        spec.setFlinkConfiguration(appConfig.toMap());
+        testScaleConditionDep(flinkDep, service, d -> {}, true);
+        testScaleConditionLastSpec(flinkDep, service, d -> {}, true);
 
         // Do not scale if config disabled
         testScaleConditionDep(
@@ -280,7 +336,7 @@ public class NativeFlinkServiceTest {
                                                 .JOB_UPGRADE_INPLACE_SCALING_ENABLED
                                                 .key(),
                                         "false"),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                false);
 
         // Do not scale without adaptive scheduler deployed
         testScaleConditionLastSpec(
@@ -291,45 +347,35 @@ public class NativeFlinkServiceTest {
                                 .put(
                                         JobManagerOptions.SCHEDULER.key(),
                                         JobManagerOptions.SchedulerType.Default.name()),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                false);
 
         // Do not scale without adaptive scheduler deployed
         testScaleConditionLastSpec(
-                flinkDep,
-                service,
-                ls -> ls.setFlinkVersion(FlinkVersion.v1_17),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                flinkDep, service, ls -> ls.setFlinkVersion(FlinkVersion.v1_17), false);
 
         testScaleConditionLastSpec(
-                flinkDep,
-                service,
-                ls -> ls.setFlinkVersion(FlinkVersion.v1_18),
-                FlinkService.ScalingResult.SCALING_TRIGGERED);
+                flinkDep, service, ls -> ls.setFlinkVersion(FlinkVersion.v1_18), true);
 
         // Make sure we only try to rescale non-terminal
         testScaleConditionDep(
                 flinkDep,
                 service,
-                d -> d.getStatus().getJobStatus().setState("FAILED"),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                d -> d.getStatus().getJobStatus().setState(JobStatus.FAILED),
+                false);
 
         testScaleConditionDep(
                 flinkDep,
                 service,
-                d -> d.getStatus().getJobStatus().setState("RECONCILING"),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                d -> d.getStatus().getJobStatus().setState(JobStatus.RECONCILING),
+                false);
 
         testScaleConditionDep(
                 flinkDep,
                 service,
-                d -> d.getStatus().getJobStatus().setState("RUNNING"),
-                FlinkService.ScalingResult.SCALING_TRIGGERED);
+                d -> d.getStatus().getJobStatus().setState(JobStatus.RUNNING),
+                true);
 
-        testScaleConditionDep(
-                flinkDep,
-                service,
-                d -> d.getSpec().setJob(null),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+        testScaleConditionDep(flinkDep, service, d -> d.getSpec().setJob(null), false);
 
         // Do not scale if parallelism overrides were removed from an active vertex
         testScaleConditionLastSpec(
@@ -338,7 +384,7 @@ public class NativeFlinkServiceTest {
                 s ->
                         s.getFlinkConfiguration()
                                 .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), v2 + ":3"),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                false);
 
         // Scale if parallelism overrides were removed only from a non-active vertex
         testScaleConditionLastSpec(
@@ -349,7 +395,7 @@ public class NativeFlinkServiceTest {
                                 .put(
                                         PipelineOptions.PARALLELISM_OVERRIDES.key(),
                                         v1 + ":1," + new JobVertexID() + ":5"),
-                FlinkService.ScalingResult.SCALING_TRIGGERED);
+                true);
 
         // Do not scale if parallelism overrides were completely removed
         var flinkDep2 = ReconciliationUtils.clone(flinkDep);
@@ -363,7 +409,7 @@ public class NativeFlinkServiceTest {
                 s ->
                         s.getFlinkConfiguration()
                                 .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), v2 + ":3"),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                false);
 
         // Do not scale if overrides never set
         testScaleConditionDep(
@@ -373,7 +419,7 @@ public class NativeFlinkServiceTest {
                         d.getSpec()
                                 .getFlinkConfiguration()
                                 .remove(PipelineOptions.PARALLELISM_OVERRIDES.key()),
-                FlinkService.ScalingResult.CANNOT_SCALE);
+                false);
 
         // Do not scale if non active vertices are overridden only
         current.set(
@@ -391,7 +437,7 @@ public class NativeFlinkServiceTest {
                         d.getSpec()
                                 .getFlinkConfiguration()
                                 .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), v2 + ":5"),
-                FlinkService.ScalingResult.ALREADY_SCALED);
+                true);
         assertNull(updated.get());
 
         // Override v2 (not in graph) + v1 with current parallelism
@@ -404,7 +450,7 @@ public class NativeFlinkServiceTest {
                                 .put(
                                         PipelineOptions.PARALLELISM_OVERRIDES.key(),
                                         v2 + ":5," + v1 + ":1"),
-                FlinkService.ScalingResult.ALREADY_SCALED);
+                true);
         assertNull(updated.get());
 
         // Scale if requirements upper/lower bound doesn't match
@@ -422,26 +468,26 @@ public class NativeFlinkServiceTest {
                                 .put(
                                         PipelineOptions.PARALLELISM_OVERRIDES.key(),
                                         v2 + ":5," + v1 + ":1"),
-                FlinkService.ScalingResult.SCALING_TRIGGERED);
+                true);
         assertEquals(
                 new JobVertexResourceRequirements.Parallelism(1, 1),
                 updated.get().get(v1).getParallelism());
 
         // Test error handling
         current.set(null);
-        testScaleConditionDep(flinkDep, service, d -> {}, FlinkService.ScalingResult.CANNOT_SCALE);
+        testScaleConditionDep(flinkDep, service, d -> {}, false);
     }
 
     private void testScaleConditionDep(
             FlinkDeployment dep,
             NativeFlinkService service,
             Consumer<FlinkDeployment> f,
-            FlinkService.ScalingResult scalingResult)
+            boolean scaled)
             throws Exception {
         var depCopy = ReconciliationUtils.clone(dep);
         f.accept(depCopy);
         assertEquals(
-                scalingResult,
+                scaled,
                 service.scale(
                         new FlinkDeploymentContext(
                                 depCopy,
@@ -456,7 +502,7 @@ public class NativeFlinkServiceTest {
             FlinkDeployment dep,
             NativeFlinkService service,
             Consumer<FlinkDeploymentSpec> f,
-            FlinkService.ScalingResult scalingResult)
+            boolean scaled)
             throws Exception {
         testScaleConditionDep(
                 dep,
@@ -467,93 +513,7 @@ public class NativeFlinkServiceTest {
                     f.accept(lastReconciledSpec);
                     reconStatus.serializeAndSetLastReconciledSpec(lastReconciledSpec, fd);
                 },
-                scalingResult);
-    }
-
-    @Test
-    public void testScalingCompleted() throws Exception {
-        var v1 = new JobVertexID();
-        var v2 = new JobVertexID();
-
-        var testingClusterClient =
-                new TestingClusterClient<>(configuration, TestUtils.TEST_DEPLOYMENT_NAME);
-        var service = (NativeFlinkService) createFlinkService(testingClusterClient);
-
-        var flinkDep = TestUtils.buildApplicationCluster();
-        var spec = flinkDep.getSpec();
-        spec.setFlinkVersion(FlinkVersion.v1_18);
-
-        var appConfig = Configuration.fromMap(spec.getFlinkConfiguration());
-        appConfig.set(
-                PipelineOptions.PARALLELISM_OVERRIDES,
-                Map.of(v1.toHexString(), "4", v2.toHexString(), "1"));
-        var reconStatus = flinkDep.getStatus().getReconciliationStatus();
-        spec.setFlinkConfiguration(appConfig.toMap());
-        reconStatus.serializeAndSetLastReconciledSpec(spec, flinkDep);
-        var jobStatus = flinkDep.getStatus().getJobStatus();
-        jobStatus.setJobId(new JobID().toHexString());
-        var ctx =
-                new FlinkDeploymentContext(
-                        flinkDep,
-                        TestUtils.createEmptyContext(),
-                        null,
-                        configManager,
-                        c -> service);
-
-        var currentJobDetails = new AtomicReference<JobDetailsInfo>();
-        testingClusterClient.setRequestProcessor(
-                (headers, parameters, requestBody) -> {
-                    if (headers instanceof JobDetailsHeaders) {
-                        return CompletableFuture.completedFuture(currentJobDetails.get());
-                    }
-                    return CompletableFuture.completedFuture(EmptyResponseBody.getInstance());
-                });
-
-        currentJobDetails.set(createJobDetailsFor(List.of()));
-        assertFalse(service.scalingCompleted(ctx));
-
-        currentJobDetails.set(
-                createJobDetailsFor(
-                        List.of(jobVertexDetailsInfo(v1, 1), jobVertexDetailsInfo(v2, 1))));
-        assertFalse(service.scalingCompleted(ctx));
-
-        currentJobDetails.set(
-                createJobDetailsFor(
-                        List.of(jobVertexDetailsInfo(v1, 4), jobVertexDetailsInfo(v2, 1))));
-        assertTrue(service.scalingCompleted(ctx));
-
-        // Make sure we don't wait for non-active vertex
-        var v3 = new JobVertexID();
-        spec.getFlinkConfiguration()
-                .put(
-                        PipelineOptions.PARALLELISM_OVERRIDES.key(),
-                        v1 + ":4," + v2 + ":1," + v3 + ":100");
-        reconStatus.serializeAndSetLastReconciledSpec(spec, flinkDep);
-        ctx =
-                new FlinkDeploymentContext(
-                        flinkDep,
-                        TestUtils.createEmptyContext(),
-                        null,
-                        configManager,
-                        c -> service);
-
-        assertTrue(service.scalingCompleted(ctx));
-    }
-
-    private JobDetailsInfo.JobVertexDetailsInfo jobVertexDetailsInfo(
-            JobVertexID jvi, int parallelism) {
-        var ioMetricsInfo = new IOMetricsInfo(0, false, 0, false, 0, false, 0, false, 0L, 0L, 0.);
-        return new JobDetailsInfo.JobVertexDetailsInfo(
-                jvi,
-                "",
-                900,
-                parallelism,
-                ExecutionState.RUNNING,
-                0,
-                0,
-                0,
-                Map.of(),
-                ioMetricsInfo);
+                scaled);
     }
 
     @Test
@@ -597,24 +557,6 @@ public class NativeFlinkServiceTest {
                 testingClusterClient, deployment, reqs.getJobVertexParallelisms());
     }
 
-    public static JobDetailsInfo createJobDetailsFor(
-            List<JobDetailsInfo.JobVertexDetailsInfo> vertexInfos) {
-        return new JobDetailsInfo(
-                new JobID(),
-                "",
-                false,
-                org.apache.flink.api.common.JobStatus.RUNNING,
-                0,
-                0,
-                0,
-                0,
-                0,
-                Map.of(),
-                vertexInfos,
-                Map.of(),
-                new JobPlanInfo.RawJson(""));
-    }
-
     class TestingNativeFlinkService extends NativeFlinkService {
         private Configuration runtimeConfig;
 
@@ -633,7 +575,7 @@ public class NativeFlinkServiceTest {
         }
 
         @Override
-        protected void submitClusterInternal(Configuration conf) throws Exception {
+        protected void submitClusterInternal(Configuration conf) {
             this.runtimeConfig = conf;
         }
 
@@ -653,9 +595,6 @@ public class NativeFlinkServiceTest {
     }
 
     private Configuration createOperatorConfig() {
-        Map<String, String> configMap = Map.of(OPERATOR_HEALTH_PROBE_PORT.key(), "80");
-        Configuration deployConfig = Configuration.fromMap(configMap);
-
-        return deployConfig;
+        return Configuration.fromMap(Map.of(OPERATOR_HEALTH_PROBE_PORT.key(), "80"));
     }
 }

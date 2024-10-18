@@ -16,14 +16,16 @@
 # limitations under the License.
 ################################################################################
 # Build
-FROM maven:3.8.4-eclipse-temurin-11 AS build
+ARG JAVA_VERSION=11
+FROM maven:3.8.8-eclipse-temurin-${JAVA_VERSION} AS build
 ARG SKIP_TESTS=true
+ARG HTTP_CLIENT=okhttp
 
 WORKDIR /app
 
 COPY . .
 
-RUN --mount=type=cache,target=/root/.m2 mvn -ntp clean install -pl flink-kubernetes-standalone,flink-kubernetes-operator-api,flink-kubernetes-operator,flink-autoscaler,flink-kubernetes-webhook -DskipTests=$SKIP_TESTS
+RUN --mount=type=cache,target=/root/.m2 mvn -ntp clean install -pl flink-kubernetes-standalone,flink-kubernetes-operator-api,flink-kubernetes-operator,flink-autoscaler,flink-kubernetes-webhook -DskipTests=$SKIP_TESTS -Dfabric8.httpclient.impl="$HTTP_CLIENT"
 
 RUN cd /app/tools/license; mkdir jars; cd jars; \
     cp /app/flink-kubernetes-operator/target/flink-kubernetes-operator-*-shaded.jar . && \
@@ -33,10 +35,10 @@ RUN cd /app/tools/license; mkdir jars; cd jars; \
     cd ../ && ./collect_license_files.sh ./jars ./licenses-output
 
 # stage
-FROM eclipse-temurin:11-jre-jammy
+FROM eclipse-temurin:${JAVA_VERSION}-jre-jammy
 ENV FLINK_HOME=/opt/flink
 ENV FLINK_PLUGINS_DIR=$FLINK_HOME/plugins
-ENV OPERATOR_VERSION=1.8-SNAPSHOT
+ENV OPERATOR_VERSION=1.11-SNAPSHOT
 ENV OPERATOR_JAR=flink-kubernetes-operator-$OPERATOR_VERSION-shaded.jar
 ENV WEBHOOK_JAR=flink-kubernetes-webhook-$OPERATOR_VERSION-shaded.jar
 ENV KUBERNETES_STANDALONE_JAR=flink-kubernetes-standalone-$OPERATOR_VERSION.jar
@@ -48,25 +50,30 @@ WORKDIR /flink-kubernetes-operator
 RUN groupadd --system --gid=9999 flink && \
     useradd --system --home-dir $FLINK_HOME --uid=9999 --gid=flink flink
 
-COPY --from=build /app/flink-kubernetes-operator/target/$OPERATOR_JAR .
-COPY --from=build /app/flink-kubernetes-webhook/target/$WEBHOOK_JAR .
-COPY --from=build /app/flink-kubernetes-standalone/target/$KUBERNETES_STANDALONE_JAR .
-COPY --from=build /app/flink-kubernetes-operator/target/plugins $FLINK_HOME/plugins
-COPY --from=build /app/tools/license/licenses-output/NOTICE .
-COPY --from=build /app/tools/license/licenses-output/licenses ./licenses
-COPY docker-entrypoint.sh /
+RUN chown -R flink:flink $FLINK_HOME
 
-RUN chown -R flink:flink $FLINK_HOME && \
-    chown flink:flink $OPERATOR_JAR && \
-    chown flink:flink $WEBHOOK_JAR && \
-    chown flink:flink $KUBERNETES_STANDALONE_JAR && \
-    chown flink:flink /docker-entrypoint.sh
+COPY --chown=flink:flink --from=build /app/flink-kubernetes-operator/target/$OPERATOR_JAR .
+COPY --chown=flink:flink --from=build /app/flink-kubernetes-webhook/target/$WEBHOOK_JAR .
+COPY --chown=flink:flink --from=build /app/flink-kubernetes-standalone/target/$KUBERNETES_STANDALONE_JAR .
+COPY --chown=flink:flink --from=build /app/flink-kubernetes-operator/target/plugins $FLINK_HOME/plugins
+COPY --chown=flink:flink --from=build /app/tools/license/licenses-output/NOTICE .
+COPY --chown=flink:flink --from=build /app/tools/license/licenses-output/licenses ./licenses
+COPY --chown=flink:flink --from=build /app/LICENSE ./LICENSE
+COPY --chown=flink:flink docker-entrypoint.sh /
 
 ARG SKIP_OS_UPDATE=true
 
 # Updating Debian
 RUN if [ "$SKIP_OS_UPDATE" = "false" ]; then apt-get update; fi
 RUN if [ "$SKIP_OS_UPDATE" = "false" ]; then apt-get upgrade -y; fi
+
+ARG DISABLE_JEMALLOC=false
+# Install jemalloc
+RUN if [ "$DISABLE_JEMALLOC" = "false" ]; then \
+  apt-get update; \
+  apt-get -y install libjemalloc-dev; \
+  rm -rf /var/lib/apt/lists/*; \
+  fi
 
 USER flink
 ENTRYPOINT ["/docker-entrypoint.sh"]

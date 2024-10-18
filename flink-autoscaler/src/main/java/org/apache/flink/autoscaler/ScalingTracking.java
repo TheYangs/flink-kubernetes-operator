@@ -20,10 +20,12 @@ package org.apache.flink.autoscaler;
 import org.apache.flink.annotation.Experimental;
 import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.autoscaler.topology.JobTopology;
+import org.apache.flink.autoscaler.topology.VertexInfo;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonIgnore;
+
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -68,7 +70,8 @@ public class ScalingTracking {
      * Sets restart duration for the latest scaling record if its parallelism matches the current
      * job parallelism.
      *
-     * @param now The instant to be used as the end time when calculating the restart duration.
+     * @param jobRunningTs The instant when the JobStatus is switched to RUNNING, it will be used as
+     *     the end time when calculating the restart duration.
      * @param jobTopology The current job topology containing details of the job's parallelism.
      * @param scalingHistory The scaling history.
      * @return true if the restart duration is successfully recorded, false if the restart duration
@@ -76,7 +79,7 @@ public class ScalingTracking {
      *     not match the actual parallelism.
      */
     public boolean recordRestartDurationIfTrackedAndParallelismMatches(
-            Instant now,
+            Instant jobRunningTs,
             JobTopology jobTopology,
             Map<JobVertexID, SortedMap<Instant, ScalingSummary>> scalingHistory) {
         return getLatestScalingRecordEntry()
@@ -88,17 +91,17 @@ public class ScalingTracking {
                                 var targetParallelism =
                                         getTargetParallelismOfScaledVertices(
                                                 scalingTimestamp, scalingHistory);
-                                var actualParallelism = jobTopology.getParallelisms();
 
                                 if (targetParallelismMatchesActual(
-                                        targetParallelism, actualParallelism)) {
+                                        targetParallelism, jobTopology.getVertexInfos())) {
                                     value.setRestartDuration(
-                                            Duration.between(scalingTimestamp, now));
+                                            Duration.between(scalingTimestamp, jobRunningTs));
                                     LOG.debug(
                                             "Recorded restart duration of {} seconds (from {} till {})",
-                                            Duration.between(scalingTimestamp, now).getSeconds(),
+                                            Duration.between(scalingTimestamp, jobRunningTs)
+                                                    .getSeconds(),
                                             scalingTimestamp,
-                                            now);
+                                            jobRunningTs);
                                     return true;
                                 }
                             } else {
@@ -127,14 +130,16 @@ public class ScalingTracking {
 
     private static boolean targetParallelismMatchesActual(
             Map<JobVertexID, Integer> targetParallelisms,
-            Map<JobVertexID, Integer> actualParallelisms) {
+            Map<JobVertexID, VertexInfo> vertexInfoMap) {
         return targetParallelisms.entrySet().stream()
                 .allMatch(
                         entry -> {
                             var vertexID = entry.getKey();
                             var targetParallelism = entry.getValue();
-                            var actualParallelism = actualParallelisms.getOrDefault(vertexID, -1);
-                            boolean isEqual = actualParallelism.equals(targetParallelism);
+                            var vertexInfo = vertexInfoMap.get(vertexID);
+                            int actualParallelism =
+                                    vertexInfo == null ? -1 : vertexInfo.getParallelism();
+                            boolean isEqual = actualParallelism == targetParallelism;
                             if (!isEqual) {
                                 LOG.debug(
                                         "Vertex {} actual parallelism {} does not match target parallelism {}",

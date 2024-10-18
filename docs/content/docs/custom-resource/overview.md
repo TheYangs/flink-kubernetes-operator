@@ -37,6 +37,9 @@ With these two Custom Resources, we can support two different operational models
 - Flink application managed by the `FlinkDeployment`
 - Empty Flink session managed by the `FlinkDeployment` + multiple jobs managed by the `FlinkSessionJobs`. The operations on the session jobs are independent of each other.
 
+To help managing snapshots, there is another CR called FlinkStateSnapshot. This can be created by the operator in case of periodic and upgrade savepoints/checkpoints, or manually by the user to trigger a savepoint/checkpoint for a job.
+FlinkStateSnapshots will always have a FlinkDeployment or FlinkSessionJob linked to them in their spec.
+
 ## FlinkDeployment
 
 FlinkDeployment objects are defined in YAML format by the user and must contain the following required fields:
@@ -85,7 +88,7 @@ The spec contains all the information the operator need to deploy and manage you
 
 Most deployments will define at least the following fields:
  - `image` : Docker used to run Flink job and task manager processes
- - `flinkVersion` : Flink version used in the image (`v1_13`, `v1_14`, `v1_15`, `v1_16` ...)
+ - `flinkVersion` : Flink version used in the image (`v1_15`, `v1_16`, `v1_17`, `v1_18`, ...)
  - `serviceAccount` : Kubernetes service account used by the Flink pods
  - `taskManager, jobManager` : Job and Task manager pod resource specs (cpu, memory, ephemeralStorage)
  - `flinkConfiguration` : Map of Flink configuration overrides such as HA and checkpointing configs
@@ -207,17 +210,14 @@ For example, to support the hadoop fs resource:
 ```shell script
 FROM apache/flink-kubernetes-operator
 ENV FLINK_PLUGINS_DIR=/opt/flink/plugins
-COPY flink-hadoop-fs-1.15-SNAPSHOT.jar $FLINK_PLUGINS_DIR/hadoop-fs/
+COPY flink-hadoop-fs-1.19-SNAPSHOT.jar $FLINK_PLUGINS_DIR/hadoop-fs/
 ```
 
 Alternatively, if you use helm to install flink-kubernetes-operator, it allows you to specify a postStart hook to download the required plugins.
 
-### Limitations
-
-- Last-state upgradeMode is currently not supported for FlinkSessionJobs
-
 ## Further information
 
+ - [Snapshots]({{< ref "docs/custom-resource/snapshots" >}})
  - [Job Management and Stateful upgrades]({{< ref "docs/custom-resource/job-management" >}})
  - [Deployment customization and pod templates]({{< ref "docs/custom-resource/pod-template" >}})
  - [Full Reference]({{< ref "docs/custom-resource/reference" >}})

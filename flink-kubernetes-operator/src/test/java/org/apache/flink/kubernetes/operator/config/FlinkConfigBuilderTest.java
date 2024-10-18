@@ -23,7 +23,6 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.DeploymentOptions;
 import org.apache.flink.configuration.DeploymentOptionsInternal;
-import org.apache.flink.configuration.HighAvailabilityOptions;
 import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.PipelineOptions;
@@ -31,7 +30,6 @@ import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.configuration.KubernetesDeploymentTarget;
-import org.apache.flink.kubernetes.highavailability.KubernetesHaServicesFactory;
 import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.api.CrdConstants;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
@@ -52,12 +50,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
-import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.PodTemplateSpec;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
 import java.io.IOException;
@@ -67,6 +63,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import static org.apache.flink.configuration.DeploymentOptions.SHUTDOWN_ON_APPLICATION_FINISH;
 import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.IMAGE;
@@ -126,8 +123,6 @@ public class FlinkConfigBuilderTest {
                 KubernetesConfigOptions.ServiceExposedType.ClusterIP,
                 configuration.get(KubernetesConfigOptions.REST_SERVICE_EXPOSED_TYPE));
         assertEquals(false, configuration.get(WebOptions.CANCEL_ENABLE));
-        assertEquals(
-                flinkDeployment.getMetadata().getName(), configuration.get(PipelineOptions.NAME));
 
         FlinkDeployment deployment = ReconciliationUtils.clone(flinkDeployment);
         deployment
@@ -145,39 +140,12 @@ public class FlinkConfigBuilderTest {
                 KubernetesConfigOptions.ServiceExposedType.LoadBalancer,
                 configuration.get(KubernetesConfigOptions.REST_SERVICE_EXPOSED_TYPE));
 
-        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.LAST_STATE);
-        configuration =
-                new FlinkConfigBuilder(
-                                deployment,
-                                new Configuration()
-                                        .set(
-                                                HighAvailabilityOptions.HA_MODE,
-                                                KubernetesHaServicesFactory.class
-                                                        .getCanonicalName()))
-                        .applyFlinkConfiguration()
-                        .build();
-        assertEquals(
-                DEFAULT_CHECKPOINTING_INTERVAL,
-                configuration.get(ExecutionCheckpointingOptions.CHECKPOINTING_INTERVAL));
-
         deployment = TestUtils.buildSessionCluster();
         configuration =
                 new FlinkConfigBuilder(deployment, new Configuration())
                         .applyFlinkConfiguration()
                         .build();
         assertEquals(false, configuration.get(WebOptions.CANCEL_ENABLE));
-    }
-
-    @ParameterizedTest
-    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
-    public void testApplyFlinkConfigurationShouldSetShutdownOnFinishBasedOnFlinkVersion(
-            FlinkVersion flinkVersion) {
-        flinkDeployment.getSpec().setFlinkVersion(flinkVersion);
-        Configuration configuration =
-                new FlinkConfigBuilder(flinkDeployment, new Configuration())
-                        .applyFlinkConfiguration()
-                        .build();
-        Assertions.assertFalse(configuration.getBoolean(SHUTDOWN_ON_APPLICATION_FINISH));
     }
 
     @Test
@@ -209,7 +177,9 @@ public class FlinkConfigBuilderTest {
         mainContainer.setName(Constants.MAIN_CONTAINER_NAME);
         mainContainer.setImage("test");
 
-        flinkDeployment.getSpec().setPodTemplate(TestUtils.getTestPod("", "", List.of(container0)));
+        flinkDeployment
+                .getSpec()
+                .setPodTemplate(TestUtils.getTestPodTemplate("", List.of(container0)));
 
         var inConfig = new Configuration();
         inConfig.set(KubernetesOperatorConfigOptions.OPERATOR_JM_STARTUP_PROBE_ENABLED, false);
@@ -227,18 +197,22 @@ public class FlinkConfigBuilderTest {
                 List.of(container0), getJmPod(configuration).getSpec().getContainers());
 
         flinkDeployment.getSpec().getJobManager().getResource().setEphemeralStorage("2G");
-        flinkDeployment.getSpec().getTaskManager().getResource().setEphemeralStorage("2G");
+        flinkDeployment.getSpec().getTaskManager().getResource().setEphemeralStorage("3G");
 
         configuration =
                 new FlinkConfigBuilder(flinkDeployment, inConfig.clone())
                         .applyPodTemplate()
                         .build();
+
+        Assertions.assertNotEquals(
+                configuration.getString(KubernetesConfigOptions.JOB_MANAGER_POD_TEMPLATE),
+                configuration.getString(KubernetesConfigOptions.TASK_MANAGER_POD_TEMPLATE));
         assertMainContainerEphemeralStorage(
                 getJmPod(configuration).getSpec().getContainers().get(1), "2G");
         Assertions.assertEquals(
                 container0, getJmPod(configuration).getSpec().getContainers().get(0));
         assertMainContainerEphemeralStorage(
-                getTmPod(configuration).getSpec().getContainers().get(1), "2G");
+                getTmPod(configuration).getSpec().getContainers().get(1), "3G");
         Assertions.assertEquals(
                 container0, getTmPod(configuration).getSpec().getContainers().get(0));
 
@@ -283,11 +257,12 @@ public class FlinkConfigBuilderTest {
         flinkDeployment
                 .getSpec()
                 .getJobManager()
-                .setPodTemplate(TestUtils.getTestPod("", "", List.of(mainContainer, container0)));
+                .setPodTemplate(
+                        TestUtils.getTestPodTemplate("", List.of(mainContainer, container0)));
         flinkDeployment
                 .getSpec()
                 .getTaskManager()
-                .setPodTemplate(TestUtils.getTestPod("", "", List.of(container1)));
+                .setPodTemplate(TestUtils.getTestPodTemplate("", List.of(container1)));
 
         configuration =
                 new FlinkConfigBuilder(flinkDeployment, inConfig.clone())
@@ -308,7 +283,7 @@ public class FlinkConfigBuilderTest {
         Assertions.assertEquals(List.of(container1), tmPod.getSpec().getContainers());
 
         // Override common
-        var common = TestUtils.getTestPod("", "", Collections.emptyList());
+        var common = TestUtils.getTestPodTemplate("", Collections.emptyList());
         common.getSpec().setDnsPolicy("test");
         flinkDeployment.getSpec().setPodTemplate(common);
 
@@ -361,28 +336,17 @@ public class FlinkConfigBuilderTest {
                 configuration.contains(KubernetesConfigOptions.TASK_MANAGER_POD_TEMPLATE));
     }
 
-    private Pod getJmPod(Configuration configuration) throws IOException {
+    private PodTemplateSpec getJmPod(Configuration configuration) throws IOException {
         return OBJECT_MAPPER.readValue(
                 new File(configuration.getString(KubernetesConfigOptions.JOB_MANAGER_POD_TEMPLATE)),
-                Pod.class);
+                PodTemplateSpec.class);
     }
 
-    private Pod getTmPod(Configuration configuration) throws IOException {
+    private PodTemplateSpec getTmPod(Configuration configuration) throws IOException {
         return OBJECT_MAPPER.readValue(
                 new File(
                         configuration.getString(KubernetesConfigOptions.TASK_MANAGER_POD_TEMPLATE)),
-                Pod.class);
-    }
-
-    @Test
-    public void testApplyIngressDomain() {
-        final Configuration configuration =
-                new FlinkConfigBuilder(flinkDeployment, new Configuration())
-                        .applyIngressDomain()
-                        .build();
-        assertEquals(
-                KubernetesConfigOptions.ServiceExposedType.ClusterIP,
-                configuration.get(KubernetesConfigOptions.REST_SERVICE_EXPOSED_TYPE));
+                PodTemplateSpec.class);
     }
 
     @Test
@@ -402,7 +366,7 @@ public class FlinkConfigBuilderTest {
 
         // We must use deprecated configs for 1.16 and before
         deploymentClone.getSpec().setFlinkVersion(FlinkVersion.v1_16);
-        deploymentClone.getSpec().setPodTemplate(new Pod());
+        deploymentClone.getSpec().setPodTemplate(new PodTemplateSpec());
         Configuration configuration =
                 new FlinkConfigBuilder(deploymentClone, new Configuration())
                         .applyJobManagerSpec()
@@ -414,6 +378,10 @@ public class FlinkConfigBuilderTest {
 
         assertEquals("1.0", confMap.get("kubernetes.jobmanager.cpu"));
         assertEquals("1.0", confMap.get("kubernetes.taskmanager.cpu"));
+        // Set new config all the time to simplify reading side
+        assertEquals(Double.valueOf(1), configuration.get(KubernetesConfigOptions.JOB_MANAGER_CPU));
+        assertEquals(
+                Double.valueOf(1), configuration.get(KubernetesConfigOptions.TASK_MANAGER_CPU));
     }
 
     @Test
@@ -447,16 +415,13 @@ public class FlinkConfigBuilderTest {
         flinkDeployment
                 .getSpec()
                 .getJobManager()
-                .setPodTemplate(
-                        TestUtils.getTestPod(
-                                "pod1 hostname", "pod1 api version", new ArrayList<>()));
+                .setPodTemplate(TestUtils.getTestPodTemplate("pod1 hostname", new ArrayList<>()));
         configuration =
                 new FlinkConfigBuilder(flinkDeployment, new Configuration())
                         .applyPodTemplate()
                         .build();
 
-        Pod jmPod = getJmPod(configuration);
-        assertEquals("pod1 api version", jmPod.getApiVersion());
+        var jmPod = getJmPod(configuration);
         assertMainContainerEphemeralStorage(jmPod.getSpec().getContainers().get(0), "2G");
     }
 
@@ -718,16 +683,13 @@ public class FlinkConfigBuilderTest {
         flinkDeployment
                 .getSpec()
                 .getTaskManager()
-                .setPodTemplate(
-                        TestUtils.getTestPod(
-                                "pod2 hostname", "pod2 api version", new ArrayList<>()));
+                .setPodTemplate(TestUtils.getTestPodTemplate("pod2 hostname", new ArrayList<>()));
         configuration =
                 new FlinkConfigBuilder(flinkDeployment, new Configuration())
                         .applyPodTemplate()
                         .build();
 
         var tmPod = getTmPod(configuration);
-        assertEquals("pod2 api version", tmPod.getApiVersion());
         assertMainContainerEphemeralStorage(tmPod.getSpec().getContainers().get(0), "2G");
     }
 
@@ -762,6 +724,22 @@ public class FlinkConfigBuilderTest {
                         .build();
 
         assertEquals(12, configuration.get(CoreOptions.DEFAULT_PARALLELISM));
+        assertEquals(
+                true, configuration.get(DeploymentOptions.SUBMIT_FAILED_JOB_ON_APPLICATION_ERROR));
+        Assertions.assertFalse(configuration.getBoolean(SHUTDOWN_ON_APPLICATION_FINISH));
+        assertEquals(
+                flinkDeployment.getMetadata().getName(), configuration.get(PipelineOptions.NAME));
+
+        dep = ReconciliationUtils.clone(deploymentClone);
+        dep.getSpec().getJob().setUpgradeMode(UpgradeMode.LAST_STATE);
+        configuration =
+                new FlinkConfigBuilder(dep, new Configuration())
+                        .applyFlinkConfiguration()
+                        .applyJobOrSessionSpec()
+                        .build();
+        assertEquals(
+                DEFAULT_CHECKPOINTING_INTERVAL,
+                configuration.get(ExecutionCheckpointingOptions.CHECKPOINTING_INTERVAL));
     }
 
     @Test
@@ -916,11 +894,11 @@ public class FlinkConfigBuilderTest {
     public void testApplyResourceToPodTemplate() {
         Resource resource = flinkDeployment.getSpec().getTaskManager().getResource();
 
-        Pod pod = FlinkConfigBuilder.applyResourceToPodTemplate(null, resource);
+        var pod = FlinkConfigBuilder.applyResourceToPodTemplate(null, resource);
         assertEquals(Constants.MAIN_CONTAINER_NAME, pod.getSpec().getContainers().get(0).getName());
         assertMainContainerEphemeralStorage(pod.getSpec().getContainers().get(0), "2G");
 
-        Pod podWithMetadata = new Pod();
+        var podWithMetadata = new PodTemplateSpec();
         ObjectMeta metaData = new ObjectMeta();
         podWithMetadata.setMetadata(metaData);
         pod = FlinkConfigBuilder.applyResourceToPodTemplate(podWithMetadata, resource);
@@ -947,14 +925,22 @@ public class FlinkConfigBuilderTest {
                         .toString());
     }
 
-    private Pod createTestPodWithContainers() {
+    private PodTemplateSpec createTestPodWithContainers() {
         Container mainContainer = new Container();
         mainContainer.setName(Constants.MAIN_CONTAINER_NAME);
         Container sideCarContainer = new Container();
         sideCarContainer.setName("sidecar");
-        Pod pod =
-                TestUtils.getTestPod(
-                        "hostname", "api version", List.of(mainContainer, sideCarContainer));
+        var pod =
+                TestUtils.getTestPodTemplate("hostname", List.of(mainContainer, sideCarContainer));
         return pod;
+    }
+
+    private static Stream<KubernetesConfigOptions.ServiceExposedType> serviceExposedTypes() {
+        return Stream.of(
+                null,
+                KubernetesConfigOptions.ServiceExposedType.ClusterIP,
+                KubernetesConfigOptions.ServiceExposedType.LoadBalancer,
+                KubernetesConfigOptions.ServiceExposedType.Headless_ClusterIP,
+                KubernetesConfigOptions.ServiceExposedType.NodePort);
     }
 }

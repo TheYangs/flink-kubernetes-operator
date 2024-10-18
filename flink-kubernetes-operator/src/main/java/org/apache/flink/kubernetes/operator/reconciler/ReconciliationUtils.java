@@ -18,6 +18,7 @@
 package org.apache.flink.kubernetes.operator.reconciler;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.autoscaler.utils.DateTimeUtils;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
@@ -25,24 +26,22 @@ import org.apache.flink.kubernetes.operator.api.reconciler.ReconciliationMetadat
 import org.apache.flink.kubernetes.operator.api.spec.AbstractFlinkSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
-import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.CommonStatus;
 import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
+import org.apache.flink.kubernetes.operator.api.status.FlinkStateSnapshotStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobManagerDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobStatus;
 import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
 import org.apache.flink.kubernetes.operator.api.status.ReconciliationStatus;
-import org.apache.flink.kubernetes.operator.api.status.SnapshotInfo;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.api.status.TaskManagerInfo;
 import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.controller.FlinkStateSnapshotContext;
 import org.apache.flink.kubernetes.operator.exception.ValidationException;
-import org.apache.flink.kubernetes.operator.service.FlinkService;
 import org.apache.flink.kubernetes.operator.utils.FlinkUtils;
 import org.apache.flink.kubernetes.operator.utils.StatusRecorder;
-import org.apache.flink.runtime.jobmanager.HighAvailabilityMode;
 
 import io.fabric8.kubernetes.client.CustomResource;
 import io.javaoperatorsdk.operator.api.reconciler.ErrorStatusUpdateControl;
@@ -53,10 +52,16 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.function.BiConsumer;
 
+import static org.apache.flink.api.common.JobStatus.CANCELED;
+import static org.apache.flink.api.common.JobStatus.CANCELLING;
 import static org.apache.flink.api.common.JobStatus.FINISHED;
+import static org.apache.flink.api.common.JobStatus.RECONCILING;
 import static org.apache.flink.api.common.JobStatus.RUNNING;
 import static org.apache.flink.kubernetes.operator.utils.FlinkResourceExceptionUtils.updateFlinkResourceException;
+import static org.apache.flink.kubernetes.operator.utils.FlinkResourceExceptionUtils.updateFlinkStateSnapshotException;
 
 /** Reconciliation utilities. */
 public class ReconciliationUtils {
@@ -111,7 +116,8 @@ public class ReconciliationUtils {
         updateStatusBeforeDeploymentAttempt(target, conf, Clock.systemDefaultZone());
     }
 
-    private static <SPEC extends AbstractFlinkSpec> void updateStatusForSpecReconciliation(
+    @VisibleForTesting
+    public static <SPEC extends AbstractFlinkSpec> void updateStatusForSpecReconciliation(
             AbstractFlinkResource<SPEC, ?> target,
             JobState stateAfterReconcile,
             Configuration conf,
@@ -181,31 +187,13 @@ public class ReconciliationUtils {
         }
     }
 
-    public static <SPEC extends AbstractFlinkSpec> void updateAfterScaleUp(
-            AbstractFlinkResource<SPEC, ?> target,
-            Configuration deployConfig,
-            Clock clock,
-            FlinkService.ScalingResult scalingResult) {
-
-        var reconState = target.getStatus().getReconciliationStatus().getState();
-        // We mark the spec reconciled, and set state upgrading only if it was already upgrading or
-        // we actually triggered a new scale up
-        ReconciliationUtils.updateStatusForSpecReconciliation(
-                target,
-                JobState.RUNNING,
-                deployConfig,
-                reconState == ReconciliationState.UPGRADING
-                        || scalingResult == FlinkService.ScalingResult.SCALING_TRIGGERED,
-                clock);
-    }
-
     public static <SPEC extends AbstractFlinkSpec> void updateLastReconciledSnapshotTriggerNonce(
-            SnapshotInfo snapshotInfo,
+            SnapshotTriggerType snapshotTriggerType,
             AbstractFlinkResource<SPEC, ?> target,
             SnapshotType snapshotType) {
 
         // We only need to update for MANUAL triggers
-        if (snapshotInfo.getTriggerType() != SnapshotTriggerType.MANUAL) {
+        if (snapshotTriggerType != SnapshotTriggerType.MANUAL) {
             return;
         }
 
@@ -248,8 +236,18 @@ public class ReconciliationUtils {
         }
     }
 
-    public static void updateForReconciliationError(FlinkResourceContext ctx, Throwable error) {
+    public static void updateForReconciliationError(FlinkResourceContext<?> ctx, Throwable error) {
         updateFlinkResourceException(error, ctx.getResource(), ctx.getOperatorConfig());
+    }
+
+    public static void updateForReconciliationError(
+            FlinkStateSnapshotContext ctx, Throwable error) {
+        var snapshot = ctx.getResource();
+        snapshot.getStatus().setState(FlinkStateSnapshotStatus.State.FAILED);
+        snapshot.getStatus().setFailures(snapshot.getStatus().getFailures() + 1);
+        snapshot.getStatus().setResultTimestamp(DateTimeUtils.kubernetes(Instant.now()));
+
+        updateFlinkStateSnapshotException(error, ctx.getResource(), ctx.getOperatorConfig());
     }
 
     public static <T> T clone(T object) {
@@ -276,10 +274,12 @@ public class ReconciliationUtils {
             return updateControl;
         }
 
+        if (isJobCancelling(status)) {
+            return updateControl.rescheduleAfter(operatorConfiguration.getProgressCheckInterval());
+        }
+
         if (upgradeStarted(
-                        status.getReconciliationStatus(),
-                        previous.getStatus().getReconciliationStatus())
-                || current.getStatus().isImmediateReconciliationNeeded()) {
+                status.getReconciliationStatus(), previous.getStatus().getReconciliationStatus())) {
             return updateControl.rescheduleAfter(0);
         }
 
@@ -297,6 +297,7 @@ public class ReconciliationUtils {
         }
     }
 
+    @VisibleForTesting
     public static Duration rescheduleAfter(
             JobManagerDeploymentStatus status,
             FlinkDeployment flinkDeployment,
@@ -329,18 +330,6 @@ public class ReconciliationUtils {
         return StringUtils.isNotEmpty(jobStatus.getSavepointInfo().getTriggerId());
     }
 
-    public static boolean isUpgradeModeChangedToLastStateAndHADisabledPreviously(
-            AbstractFlinkResource<?, ?> flinkApp, Configuration observeConfig) {
-
-        var deployedSpec = getDeployedSpec(flinkApp);
-        UpgradeMode previousUpgradeMode = deployedSpec.getJob().getUpgradeMode();
-        UpgradeMode currentUpgradeMode = flinkApp.getSpec().getJob().getUpgradeMode();
-
-        return previousUpgradeMode != UpgradeMode.LAST_STATE
-                && currentUpgradeMode == UpgradeMode.LAST_STATE
-                && !HighAvailabilityMode.isHighAvailabilityModeActivated(observeConfig);
-    }
-
     public static <SPEC extends AbstractFlinkSpec> SPEC getDeployedSpec(
             AbstractFlinkResource<SPEC, ?> deployment) {
         var reconciliationStatus = deployment.getStatus().getReconciliationStatus();
@@ -360,22 +349,29 @@ public class ReconciliationUtils {
         if (currentReconState == previousReconState) {
             return false;
         }
-        if (currentStatus.scalingInProgress()) {
-            return false;
-        }
         return currentReconState == ReconciliationState.ROLLING_BACK
                 || currentReconState == ReconciliationState.UPGRADING;
     }
 
     public static boolean isJobInTerminalState(CommonStatus<?> status) {
         var jobState = status.getJobStatus().getState();
-        return org.apache.flink.api.common.JobStatus.valueOf(jobState).isGloballyTerminalState();
+        return jobState != null && jobState.isGloballyTerminalState();
     }
 
     public static boolean isJobRunning(CommonStatus<?> status) {
-        return org.apache.flink.api.common.JobStatus.RUNNING
-                .name()
-                .equals(status.getJobStatus().getState());
+        return RUNNING == status.getJobStatus().getState();
+    }
+
+    public static boolean isJobCancelled(CommonStatus<?> status) {
+        return CANCELED == status.getJobStatus().getState();
+    }
+
+    public static boolean isJobCancellable(CommonStatus<?> status) {
+        return RECONCILING != status.getJobStatus().getState();
+    }
+
+    public static boolean isJobCancelling(CommonStatus<?> status) {
+        return status.getJobStatus() != null && CANCELLING == status.getJobStatus().getState();
     }
 
     /**
@@ -400,7 +396,6 @@ public class ReconciliationUtils {
         var deployment = ctx.getResource();
         var status = deployment.getStatus();
         if (!validationError.equals(status.getError())) {
-            LOG.error("Validation failed: " + validationError);
             ReconciliationUtils.updateForReconciliationError(
                     ctx, new ValidationException(validationError));
         }
@@ -420,10 +415,7 @@ public class ReconciliationUtils {
                 // running
                 deployment.getSpec().getJob().setState(JobState.RUNNING);
             }
-            deployment
-                    .getMetadata()
-                    .setGeneration(
-                            lastReconciledSpecWithMeta.getMeta().getMetadata().getGeneration());
+            deployment.getMetadata().setGeneration(status.getObservedGeneration());
             return true;
         }
     }
@@ -469,16 +461,9 @@ public class ReconciliationUtils {
      * @return The spec generation for the upgrade.
      */
     public static Long getUpgradeTargetGeneration(AbstractFlinkResource<?, ?> resource) {
-        var lastSpecWithMeta =
-                resource.getStatus()
-                        .getReconciliationStatus()
-                        .deserializeLastReconciledSpecWithMeta();
+        var observedGeneration = resource.getStatus().getObservedGeneration();
 
-        if (lastSpecWithMeta.getMeta() == null) {
-            return -1L;
-        }
-
-        return lastSpecWithMeta.getMeta().getMetadata().getGeneration();
+        return observedGeneration == null ? -1L : observedGeneration;
     }
 
     /**
@@ -496,6 +481,7 @@ public class ReconciliationUtils {
         }
 
         if (lastSpecWithMeta.getMeta().isFirstDeployment()) {
+            LOG.info("Clearing last reconciled spec after initial deploy failure");
             reconStatus.setLastReconciledSpec(null);
             reconStatus.setState(ReconciliationState.UPGRADING);
         }
@@ -508,8 +494,7 @@ public class ReconciliationUtils {
      * @param status Status to be updated.
      */
     public static void checkAndUpdateStableSpec(CommonStatus<?> status) {
-        var flinkJobStatus =
-                org.apache.flink.api.common.JobStatus.valueOf(status.getJobStatus().getState());
+        var flinkJobStatus = status.getJobStatus().getState();
 
         if (status.getReconciliationStatus().getState() != ReconciliationState.DEPLOYED) {
             return;
@@ -547,8 +532,7 @@ public class ReconciliationUtils {
         var lastJobSpec = lastSpecWithMeta.getSpec().getJob();
         if (lastJobSpec != null) {
             lastJobSpec.setState(JobState.RUNNING);
-            status.getJobStatus()
-                    .setState(org.apache.flink.api.common.JobStatus.RECONCILING.name());
+            status.getJobStatus().setState(RECONCILING);
         }
         reconciliationStatus.setState(ReconciliationState.DEPLOYED);
         reconciliationStatus.setLastReconciledSpec(
@@ -569,5 +553,16 @@ public class ReconciliationUtils {
 
         reconciliationStatus.setLastReconciledSpec(
                 SpecUtils.writeSpecWithMeta(lastSpecWithMeta.getSpec(), newMeta));
+        resource.getStatus().setObservedGeneration(resource.getMetadata().getGeneration());
+    }
+
+    public static <T extends AbstractFlinkSpec> void updateLastReconciledSpec(
+            AbstractFlinkResource<T, ?> resource, BiConsumer<T, ReconciliationMetadata> update) {
+        var reconStatus = resource.getStatus().getReconciliationStatus();
+        var specWithMeta = reconStatus.deserializeLastReconciledSpecWithMeta();
+        var spec = specWithMeta.getSpec();
+        var meta = specWithMeta.getMeta();
+        update.accept(spec, meta);
+        reconStatus.setLastReconciledSpec(SpecUtils.writeSpecWithMeta(spec, meta));
     }
 }

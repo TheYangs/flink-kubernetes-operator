@@ -22,7 +22,6 @@ import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.autoscaler.metrics.FlinkMetric;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.runtime.highavailability.nonha.standalone.StandaloneClientHAServices;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
@@ -45,25 +44,30 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /** Tests for {@link RestApiMetricsCollector}. */
-public class RestApiMetricsCollectorTest {
+class RestApiMetricsCollectorTest {
 
     private static final String GC_METRIC_NAME = "Status.JVM.GarbageCollector.All.TimeMsPerSecond";
     private static final String HEAP_MAX_NAME = "Status.JVM.Memory.Heap.Max";
     private static final String HEAP_USED_NAME = "Status.JVM.Memory.Heap.Used";
+    private static final String MANAGED_MEMORY_NAME = "Status.Flink.Memory.Managed.Used";
+    private static final String METASPACE_MEMORY_NAME = "Status.JVM.Memory.Metaspace.Used";
 
     @Test
-    public void testAggregateMultiplePendingRecordsMetricsPerSource() throws Exception {
+    void testAggregateMultiplePendingRecordsMetricsPerSource() throws Exception {
         var collector = new RestApiMetricsCollector<JobID, JobAutoScalerContext<JobID>>();
 
         JobVertexID jobVertexID = new JobVertexID();
@@ -76,11 +80,26 @@ public class RestApiMetricsCollectorTest {
         var aggregatedMetricsResponse =
                 List.of(
                         new AggregatedMetric(
-                                "a.pendingRecords", Double.NaN, Double.NaN, Double.NaN, 100.),
+                                "a.pendingRecords",
+                                Double.NaN,
+                                Double.NaN,
+                                Double.NaN,
+                                100.,
+                                Double.NaN),
                         new AggregatedMetric(
-                                "b.pendingRecords", Double.NaN, Double.NaN, Double.NaN, 100.),
+                                "b.pendingRecords",
+                                Double.NaN,
+                                Double.NaN,
+                                Double.NaN,
+                                100.,
+                                Double.NaN),
                         new AggregatedMetric(
-                                "c.unrelated", Double.NaN, Double.NaN, Double.NaN, 100.));
+                                "c.unrelated",
+                                Double.NaN,
+                                Double.NaN,
+                                Double.NaN,
+                                100.,
+                                Double.NaN));
 
         var conf = new Configuration();
         var restClusterClient =
@@ -115,8 +134,6 @@ public class RestApiMetricsCollectorTest {
                         JobStatus.RUNNING,
                         conf,
                         new UnregisteredMetricsGroup(),
-                        0,
-                        MemorySize.ZERO,
                         () -> restClusterClient);
 
         var jobVertexIDMapMap = collector.queryAllAggregatedMetrics(context, metrics);
@@ -131,7 +148,7 @@ public class RestApiMetricsCollectorTest {
 
     @Test
     @Timeout(60)
-    public void testJmMetricCollection() throws Exception {
+    void testJmMetricCollection() throws Exception {
         try (MiniCluster miniCluster =
                 new MiniCluster(
                         new MiniClusterConfiguration.Builder()
@@ -146,36 +163,38 @@ public class RestApiMetricsCollectorTest {
                             (c, e) ->
                                     new StandaloneClientHAServices(
                                             miniCluster.getRestAddress().get().toString()));
-            do {
-                var collector = new RestApiMetricsCollector<>();
-                Map<FlinkMetric, Metric> flinkMetricMetricMap =
-                        collector.queryJmMetrics(
-                                client,
-                                Map.of(
-                                        "taskSlotsTotal", FlinkMetric.NUM_TASK_SLOTS_TOTAL,
-                                        "taskSlotsAvailable",
-                                                FlinkMetric.NUM_TASK_SLOTS_AVAILABLE));
-                try {
-                    assertEquals(
-                            "3",
-                            flinkMetricMetricMap.get(FlinkMetric.NUM_TASK_SLOTS_TOTAL).getValue());
-                    assertEquals(
-                            "3",
-                            flinkMetricMetricMap
-                                    .get(FlinkMetric.NUM_TASK_SLOTS_AVAILABLE)
-                                    .getValue());
-                    break;
-                } catch (NullPointerException e) {
-                    // Metrics might not be available yet (timeout above will eventually kill this
-                    // test)
-                    Thread.sleep(100);
-                }
-            } while (true);
+            var collector = new RestApiMetricsCollector<>();
+            Map<FlinkMetric, Metric> flinkMetricMetricMap = new HashMap<>();
+            // Metrics might not be available yet so retry the query until it returns results or the
+            // timeout reached.
+            await().atMost(Duration.ofSeconds(60))
+                    .until(
+                            () -> {
+                                final Map<FlinkMetric, Metric> results =
+                                        collector.queryJmMetrics(
+                                                client,
+                                                Map.of(
+                                                        "taskSlotsTotal",
+                                                        FlinkMetric.NUM_TASK_SLOTS_TOTAL,
+                                                        "taskSlotsAvailable",
+                                                        FlinkMetric.NUM_TASK_SLOTS_AVAILABLE));
+                                flinkMetricMetricMap.putAll(results);
+                                return !results.isEmpty();
+                            });
+
+            assertThat(flinkMetricMetricMap)
+                    .hasSize(2)
+                    .hasEntrySatisfying(
+                            FlinkMetric.NUM_TASK_SLOTS_TOTAL,
+                            metricValue -> assertMetricValueIs(metricValue, 3))
+                    .hasEntrySatisfying(
+                            FlinkMetric.NUM_TASK_SLOTS_AVAILABLE,
+                            metricValue -> assertMetricValueIs(metricValue, 3));
         }
     }
 
     @Test
-    public void testTmMetricCollection() throws Exception {
+    void testTmMetricCollection() throws Exception {
 
         var metricValues = new HashMap<String, AggregatedMetric>();
 
@@ -228,34 +247,50 @@ public class RestApiMetricsCollectorTest {
                         JobStatus.RUNNING,
                         conf,
                         new UnregisteredMetricsGroup(),
-                        0,
-                        MemorySize.ZERO,
                         () -> client);
         var collector = new RestApiMetricsCollector<JobID, JobAutoScalerContext<JobID>>();
 
         assertThrows(RuntimeException.class, () -> collector.queryTmMetrics(context));
 
         // Test only heap metrics available
-        var heapMax = new AggregatedMetric(HEAP_MAX_NAME, null, 100., null, null);
-        var heapUsed = new AggregatedMetric(HEAP_USED_NAME, null, 50., null, null);
+        var heapMax = new AggregatedMetric(HEAP_MAX_NAME, null, 100., null, null, Double.NaN);
+        var heapUsed = new AggregatedMetric(HEAP_USED_NAME, null, 50., null, null, Double.NaN);
+        var managedUsed =
+                new AggregatedMetric(MANAGED_MEMORY_NAME, null, 42., null, null, Double.NaN);
+        var metaspaceUsed =
+                new AggregatedMetric(METASPACE_MEMORY_NAME, null, 11., null, null, Double.NaN);
         metricValues.put(HEAP_MAX_NAME, heapMax);
         metricValues.put(HEAP_USED_NAME, heapUsed);
+        metricValues.put(MANAGED_MEMORY_NAME, managedUsed);
+        metricValues.put(METASPACE_MEMORY_NAME, metaspaceUsed);
 
         assertMetricsEquals(
-                Map.of(FlinkMetric.HEAP_MAX, heapMax, FlinkMetric.HEAP_USED, heapUsed),
+                Map.of(
+                        FlinkMetric.HEAP_MEMORY_MAX,
+                        heapMax,
+                        FlinkMetric.HEAP_MEMORY_USED,
+                        heapUsed,
+                        FlinkMetric.MANAGED_MEMORY_USED,
+                        managedUsed,
+                        FlinkMetric.METASPACE_MEMORY_USED,
+                        metaspaceUsed),
                 collector.queryTmMetrics(context));
         collector.cleanup(context.getJobKey());
 
         // Test all metrics available
-        var gcTime = new AggregatedMetric(GC_METRIC_NAME, null, 150., null, null);
+        var gcTime = new AggregatedMetric(GC_METRIC_NAME, null, 150., null, null, Double.NaN);
         metricValues.put(GC_METRIC_NAME, gcTime);
 
         assertMetricsEquals(
                 Map.of(
-                        FlinkMetric.HEAP_MAX,
+                        FlinkMetric.HEAP_MEMORY_MAX,
                         heapMax,
-                        FlinkMetric.HEAP_USED,
+                        FlinkMetric.HEAP_MEMORY_USED,
                         heapUsed,
+                        FlinkMetric.MANAGED_MEMORY_USED,
+                        managedUsed,
+                        FlinkMetric.METASPACE_MEMORY_USED,
+                        metaspaceUsed,
                         FlinkMetric.TOTAL_GC_TIME_PER_SEC,
                         gcTime),
                 collector.queryTmMetrics(context));
@@ -278,5 +313,9 @@ public class RestApiMetricsCollectorTest {
                     assertEquals(v.getAvg(), a.getAvg(), k.name());
                     assertEquals(v.getSum(), a.getSum(), k.name());
                 });
+    }
+
+    private static void assertMetricValueIs(Metric metricValue, int expected) {
+        assertThat(metricValue.getValue()).asInt().isEqualTo(expected);
     }
 }

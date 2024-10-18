@@ -33,8 +33,6 @@ import org.apache.flink.kubernetes.operator.utils.StandaloneKubernetesUtils;
 import org.apache.flink.util.concurrent.Executors;
 
 import io.fabric8.kubernetes.api.model.ObjectMeta;
-import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.PodList;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
 import io.fabric8.kubernetes.api.model.apps.DeploymentSpec;
 import io.fabric8.kubernetes.client.NamespacedKubernetesClient;
@@ -99,7 +97,8 @@ public class StandaloneFlinkServiceTest {
                 new Configuration(),
                 false);
 
-        assertEquals(2, mockServer.getRequestCount() - requestsBeforeDelete);
+        assertEquals(4, mockServer.getRequestCount() - requestsBeforeDelete);
+
         assertTrue(mockServer.getLastRequest().getPath().contains("taskmanager"));
 
         deployments = kubernetesClient.apps().deployments().list().getItems();
@@ -120,8 +119,6 @@ public class StandaloneFlinkServiceTest {
                 flinkDeployment.getStatus(),
                 new Configuration(),
                 true);
-
-        assertEquals(2, service.nbCall);
 
         deployments = kubernetesClient.apps().deployments().list().getItems();
 
@@ -153,8 +150,7 @@ public class StandaloneFlinkServiceTest {
                                 TestUtils.createTestMetricGroup(new Configuration()),
                                 null)
                         .getResourceContext(flinkDeployment, TestUtils.createEmptyContext());
-        assertEquals(
-                FlinkService.ScalingResult.SCALING_TRIGGERED,
+        assertTrue(
                 flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
         assertEquals(
                 5,
@@ -184,8 +180,7 @@ public class StandaloneFlinkServiceTest {
 
         // Add replicas and verify that the scaling is not honoured as reactive mode not enabled
         flinkDeployment.getSpec().getTaskManager().setReplicas(10);
-        assertEquals(
-                FlinkService.ScalingResult.CANNOT_SCALE,
+        assertFalse(
                 flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
     }
 
@@ -213,8 +208,7 @@ public class StandaloneFlinkServiceTest {
                                 TestUtils.createTestMetricGroup(new Configuration()),
                                 null)
                         .getResourceContext(flinkDeployment, TestUtils.createEmptyContext());
-        assertEquals(
-                FlinkService.ScalingResult.SCALING_TRIGGERED,
+        assertTrue(
                 flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
 
         assertEquals(
@@ -231,8 +225,7 @@ public class StandaloneFlinkServiceTest {
         // Scale the replica count of the task managers
         flinkDeployment.getSpec().getTaskManager().setReplicas(10);
         createDeployments(flinkDeployment);
-        assertEquals(
-                FlinkService.ScalingResult.SCALING_TRIGGERED,
+        assertTrue(
                 flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
 
         assertEquals(
@@ -270,7 +263,6 @@ public class StandaloneFlinkServiceTest {
 
     class TestingStandaloneFlinkService extends StandaloneFlinkService {
         Configuration runtimeConfig;
-        int nbCall = 0;
 
         public TestingStandaloneFlinkService(StandaloneFlinkService service) {
             super(
@@ -287,17 +279,6 @@ public class StandaloneFlinkServiceTest {
         @Override
         protected void submitClusterInternal(Configuration conf, Mode mode) {
             this.runtimeConfig = conf;
-        }
-
-        @Override
-        protected PodList getTmPodList(String namespace, String clusterId) {
-            nbCall++;
-            PodList podList = new PodList();
-            if (nbCall == 1) {
-                Pod pod = new Pod();
-                podList.setItems(List.of(pod));
-            }
-            return podList;
         }
     }
 

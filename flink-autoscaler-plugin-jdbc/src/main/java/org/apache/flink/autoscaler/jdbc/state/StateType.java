@@ -26,7 +26,9 @@ public enum StateType {
     SCALING_HISTORY("scalingHistory"),
     SCALING_TRACKING("scalingTracking"),
     COLLECTED_METRICS("collectedMetrics"),
-    PARALLELISM_OVERRIDES("parallelismOverrides");
+    PARALLELISM_OVERRIDES("parallelismOverrides"),
+    CONFIG_OVERRIDES("configOverrides"),
+    DELAYED_SCALE_DOWN("delayedScaleDown");
 
     /**
      * The identifier of each state type, it will be used to store. Please ensure the identifier is

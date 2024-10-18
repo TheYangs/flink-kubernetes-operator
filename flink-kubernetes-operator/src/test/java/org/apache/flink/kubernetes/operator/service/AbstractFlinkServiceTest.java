@@ -36,7 +36,7 @@ import org.apache.flink.kubernetes.operator.TestingRestClient;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
-import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
+import org.apache.flink.kubernetes.operator.api.status.CheckpointType;
 import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobManagerDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobStatus;
@@ -46,16 +46,14 @@ import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
-import org.apache.flink.kubernetes.operator.exception.RecoveryFailureException;
+import org.apache.flink.kubernetes.operator.exception.UpgradeFailureException;
 import org.apache.flink.kubernetes.operator.observer.CheckpointFetchResult;
 import org.apache.flink.kubernetes.operator.observer.SavepointFetchResult;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
-import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.instance.HardwareDescription;
 import org.apache.flink.runtime.messages.Acknowledge;
-import org.apache.flink.runtime.messages.webmonitor.JobDetails;
 import org.apache.flink.runtime.rest.RestClient;
 import org.apache.flink.runtime.rest.handler.async.AsynchronousOperationResult;
 import org.apache.flink.runtime.rest.handler.async.TriggerResponse;
@@ -79,6 +77,7 @@ import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointTriggerReq
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerInfo;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagersHeaders;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagersInfo;
+import org.apache.flink.runtime.rest.util.RestClientException;
 import org.apache.flink.runtime.rest.util.RestMapperUtils;
 import org.apache.flink.runtime.scheduler.stopwithsavepoint.StopWithSavepointStoppingException;
 import org.apache.flink.runtime.taskexecutor.TaskExecutorMemoryConfiguration;
@@ -93,12 +92,22 @@ import org.apache.flink.util.concurrent.Executors;
 import org.apache.flink.util.function.TriFunction;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpResponseStatus;
 
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
+import io.fabric8.kubernetes.api.model.ListMeta;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.PodList;
+import io.fabric8.kubernetes.api.model.WatchEvent;
+import io.fabric8.kubernetes.api.model.apps.Deployment;
+import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
+import io.fabric8.kubernetes.api.model.apps.DeploymentList;
+import io.fabric8.kubernetes.api.model.apps.DeploymentListBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
+import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -108,11 +117,12 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.HttpURLConnection;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -123,7 +133,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
-import static org.apache.flink.kubernetes.operator.api.status.SavepointFormatType.NATIVE;
+import static org.apache.flink.api.common.JobStatus.CANCELLING;
+import static org.apache.flink.api.common.JobStatus.FAILING;
+import static org.apache.flink.api.common.JobStatus.FINISHED;
+import static org.apache.flink.api.common.JobStatus.RUNNING;
 import static org.apache.flink.kubernetes.operator.config.FlinkConfigBuilder.FLINK_VERSION;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_SAVEPOINT_FORMAT_TYPE;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -144,6 +157,7 @@ public class AbstractFlinkServiceTest {
     File testJar;
 
     private KubernetesClient client;
+    private KubernetesMockServer mockServer;
     private final Configuration configuration = new Configuration();
 
     private final FlinkConfigManager configManager = new FlinkConfigManager(configuration);
@@ -197,12 +211,14 @@ public class AbstractFlinkServiceTest {
                 .serializeAndSetLastReconciledSpec(session.getSpec(), session);
 
         var job = TestUtils.buildSessionJob();
-        var deployConf = configManager.getSessionJobConfig(session, job.getSpec());
+        var deployConf =
+                configManager.getSessionJobConfig(
+                        job.getMetadata().getName(), session, job.getSpec());
         flinkService.submitJobToSessionCluster(
                 job.getMetadata(), job.getSpec(), JobID.generate(), deployConf, null);
 
         // Make sure that deploy conf was passed to jar run
-        if (flinkVersion.isNewerVersionThan(FlinkVersion.v1_16)) {
+        if (flinkVersion.isEqualOrNewer(FlinkVersion.v1_17)) {
             assertEquals(deployConf.toMap(), jarRuns.get(0).getFlinkConfiguration().toMap());
         } else {
             assertTrue(jarRuns.get(0).getFlinkConfiguration().toMap().isEmpty());
@@ -281,15 +297,63 @@ public class AbstractFlinkServiceTest {
         ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
 
         deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
-        deployment.getStatus().getJobStatus().setState("RUNNING");
+        deployment.getStatus().getJobStatus().setState(RUNNING);
         flinkService.cancelJob(
                 deployment,
-                UpgradeMode.STATELESS,
+                SuspendMode.STATELESS,
                 configManager.getObserveConfig(deployment),
                 false);
         assertTrue(cancelFuture.isDone());
         assertEquals(jobID, cancelFuture.get());
         assertNull(jobStatus.getSavepointInfo().getLastSavepoint());
+        assertNull(jobStatus.getUpgradeSavepointPath());
+        assertEquals(FINISHED, jobStatus.getState());
+        assertEquals(
+                List.of(
+                        Tuple2.of(
+                                deployment.getMetadata().getNamespace(),
+                                deployment.getMetadata().getName())),
+                flinkService.deleted);
+        assertEquals(
+                List.of(
+                        Tuple2.of(
+                                deployment.getMetadata().getNamespace(),
+                                deployment.getMetadata().getName())),
+                flinkService.haDeleted);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {404, 409, 500})
+    public void cancelErrorHandling(int statusCode) throws Exception {
+
+        var testingClusterClient =
+                new TestingClusterClient<>(configuration, TestUtils.TEST_DEPLOYMENT_NAME);
+        testingClusterClient.setCancelFunction(
+                jobID ->
+                        CompletableFuture.failedFuture(
+                                new RuntimeException(
+                                        new RestClientException(
+                                                "errrr", HttpResponseStatus.valueOf(statusCode)))));
+        var flinkService = new TestingService(testingClusterClient);
+
+        JobID jobID = JobID.generate();
+        var job = TestUtils.buildSessionJob();
+        var jobStatus = job.getStatus().getJobStatus();
+        jobStatus.setJobId(jobID.toHexString());
+        jobStatus.setState(RUNNING);
+        ReconciliationUtils.updateStatusForDeployedSpec(job, new Configuration());
+
+        if (statusCode == 500) {
+            assertThrows(
+                    Exception.class,
+                    () ->
+                            flinkService.cancelSessionJob(
+                                    job, SuspendMode.STATELESS, new Configuration()));
+            assertEquals(RUNNING, jobStatus.getState());
+        } else {
+            flinkService.cancelSessionJob(job, SuspendMode.STATELESS, new Configuration());
+            assertEquals(CANCELLING, jobStatus.getState());
+        }
     }
 
     @ParameterizedTest
@@ -320,28 +384,35 @@ public class AbstractFlinkServiceTest {
         deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
         JobStatus jobStatus = deployment.getStatus().getJobStatus();
         jobStatus.setJobId(jobID.toHexString());
-        jobStatus.setState(org.apache.flink.api.common.JobStatus.RUNNING.name());
+        jobStatus.setState(RUNNING);
         ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
 
-        flinkService.cancelJob(
-                deployment,
-                UpgradeMode.SAVEPOINT,
-                configManager.getObserveConfig(deployment),
-                deleteAfterSavepoint);
+        var result =
+                flinkService.cancelJob(
+                        deployment,
+                        SuspendMode.SAVEPOINT,
+                        configManager.getObserveConfig(deployment),
+                        deleteAfterSavepoint);
+        assertEquals(savepointPath, result.getSavepointPath().get());
+
         assertTrue(stopWithSavepointFuture.isDone());
         assertEquals(jobID, stopWithSavepointFuture.get().f0);
         assertFalse(stopWithSavepointFuture.get().f1);
         assertEquals(savepointPath, stopWithSavepointFuture.get().f2);
-        assertEquals(savepointPath, jobStatus.getSavepointInfo().getLastSavepoint().getLocation());
 
-        assertEquals(jobStatus.getState(), org.apache.flink.api.common.JobStatus.FINISHED.name());
+        assertEquals(jobStatus.getState(), org.apache.flink.api.common.JobStatus.FINISHED);
         assertEquals(
                 deployment.getStatus().getJobManagerDeploymentStatus(),
                 deleteAfterSavepoint
                         ? JobManagerDeploymentStatus.MISSING
                         : JobManagerDeploymentStatus.READY);
         if (deleteAfterSavepoint) {
-            assertEquals(List.of(deployment.getMetadata()), flinkService.deleted);
+            assertEquals(
+                    List.of(
+                            Tuple2.of(
+                                    deployment.getMetadata().getNamespace(),
+                                    deployment.getMetadata().getName())),
+                    flinkService.deleted);
         } else {
             assertTrue(flinkService.deleted.isEmpty());
         }
@@ -376,7 +447,7 @@ public class AbstractFlinkServiceTest {
         deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
         JobStatus jobStatus = deployment.getStatus().getJobStatus();
         jobStatus.setJobId(jobID.toHexString());
-        jobStatus.setState(org.apache.flink.api.common.JobStatus.RUNNING.name());
+        jobStatus.setState(RUNNING);
         ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
 
         if (drainOnSavepoint) {
@@ -390,15 +461,17 @@ public class AbstractFlinkServiceTest {
                     .put(KubernetesOperatorConfigOptions.DRAIN_ON_SAVEPOINT_DELETION.key(), "true");
         }
 
-        flinkService.cancelJob(
-                deployment,
-                UpgradeMode.SAVEPOINT,
-                configManager.getObserveConfig(deployment),
-                true);
+        var result =
+                flinkService.cancelJob(
+                        deployment,
+                        SuspendMode.SAVEPOINT,
+                        configManager.getObserveConfig(deployment),
+                        true);
+        assertEquals(savepointPath, result.getSavepointPath().get());
+
         assertTrue(stopWithSavepointFuture.isDone());
         assertEquals(jobID, stopWithSavepointFuture.get().f0);
-        assertEquals(savepointPath, jobStatus.getSavepointInfo().getLastSavepoint().getLocation());
-        assertEquals(jobStatus.getState(), org.apache.flink.api.common.JobStatus.FINISHED.name());
+        assertEquals(jobStatus.getState(), org.apache.flink.api.common.JobStatus.FINISHED);
 
         if (drainOnSavepoint) {
             assertTrue(stopWithSavepointFuture.get().f1);
@@ -440,7 +513,7 @@ public class AbstractFlinkServiceTest {
 
         JobStatus jobStatus = job.getStatus().getJobStatus();
         jobStatus.setJobId(jobID.toHexString());
-        jobStatus.setState(org.apache.flink.api.common.JobStatus.RUNNING.name());
+        jobStatus.setState(RUNNING);
         ReconciliationUtils.updateStatusForDeployedSpec(job, new Configuration());
 
         if (drainOnSavepoint) {
@@ -451,13 +524,16 @@ public class AbstractFlinkServiceTest {
                     .getFlinkConfiguration()
                     .put(KubernetesOperatorConfigOptions.DRAIN_ON_SAVEPOINT_DELETION.key(), "true");
         }
-        var deployConf = configManager.getSessionJobConfig(session, job.getSpec());
+        var deployConf =
+                configManager.getSessionJobConfig(
+                        job.getMetadata().getName(), session, job.getSpec());
 
-        flinkService.cancelSessionJob(job, UpgradeMode.SAVEPOINT, deployConf);
+        var result = flinkService.cancelSessionJob(job, SuspendMode.SAVEPOINT, deployConf);
         assertTrue(stopWithSavepointFuture.isDone());
         assertEquals(jobID, stopWithSavepointFuture.get().f0);
-        assertEquals(savepointPath, jobStatus.getSavepointInfo().getLastSavepoint().getLocation());
-        assertEquals(jobStatus.getState(), org.apache.flink.api.common.JobStatus.FINISHED.name());
+        assertEquals(jobStatus.getState(), org.apache.flink.api.common.JobStatus.FINISHED);
+
+        assertEquals(savepointPath, result.getSavepointPath().get());
 
         if (drainOnSavepoint) {
             assertTrue(stopWithSavepointFuture.get().f1);
@@ -467,7 +543,7 @@ public class AbstractFlinkServiceTest {
     }
 
     @Test
-    public void cancelJobWithLastStateUpgradeModeTest() throws Exception {
+    public void jobCancelTest() throws Exception {
         var deployment = TestUtils.buildApplicationCluster();
         ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
         var testingClusterClient =
@@ -477,13 +553,13 @@ public class AbstractFlinkServiceTest {
         JobID jobID = JobID.generate();
         JobStatus jobStatus = deployment.getStatus().getJobStatus();
         jobStatus.setJobId(jobID.toHexString());
+        jobStatus.setState(FAILING);
 
         flinkService.cancelJob(
-                deployment,
-                UpgradeMode.LAST_STATE,
-                configManager.getObserveConfig(deployment),
-                false);
-        assertNull(jobStatus.getSavepointInfo().getLastSavepoint());
+                deployment, SuspendMode.CANCEL, configManager.getObserveConfig(deployment), false);
+        assertTrue(flinkService.haDeleted.isEmpty());
+        assertTrue(flinkService.deleted.isEmpty());
+        assertEquals(CANCELLING, jobStatus.getState());
     }
 
     @Test
@@ -493,9 +569,9 @@ public class AbstractFlinkServiceTest {
                 new TestingService(null) {
                     @Override
                     protected void deleteClusterInternal(
-                            ObjectMeta meta,
+                            String ns,
+                            String clusterId,
                             Configuration conf,
-                            boolean deleteHaData,
                             DeletionPropagation deletionPropagation) {
                         propagation.add(deletionPropagation);
                     }
@@ -514,9 +590,9 @@ public class AbstractFlinkServiceTest {
                 new TestingService(null) {
                     @Override
                     protected void deleteClusterInternal(
-                            ObjectMeta meta,
+                            String ns,
+                            String clusterId,
                             Configuration conf,
-                            boolean deleteHaData,
                             DeletionPropagation deletionPropagation) {
                         propagation.add(deletionPropagation);
                     }
@@ -556,9 +632,9 @@ public class AbstractFlinkServiceTest {
         flinkDeployment.getStatus().setJobStatus(jobStatus);
         flinkService.triggerSavepoint(
                 flinkDeployment.getStatus().getJobStatus().getJobId(),
-                SnapshotTriggerType.MANUAL,
-                flinkDeployment.getStatus().getJobStatus().getSavepointInfo(),
-                configuration);
+                SavepointFormatType.NATIVE,
+                savepointPath,
+                new Configuration());
         assertTrue(triggerSavepointFuture.isDone());
         assertEquals(jobID, triggerSavepointFuture.get().f0);
         assertEquals(savepointPath, triggerSavepointFuture.get().f1);
@@ -584,11 +660,16 @@ public class AbstractFlinkServiceTest {
         JobStatus jobStatus = new JobStatus();
         jobStatus.setJobId(jobID.toString());
         flinkDeployment.getStatus().setJobStatus(jobStatus);
-        flinkService.triggerCheckpoint(
-                flinkDeployment.getStatus().getJobStatus().getJobId(),
-                SnapshotTriggerType.MANUAL,
-                flinkDeployment.getStatus().getJobStatus().getCheckpointInfo(),
-                configuration);
+        var triggerId =
+                flinkService.triggerCheckpoint(
+                        flinkDeployment.getStatus().getJobStatus().getJobId(),
+                        org.apache.flink.core.execution.CheckpointType.FULL,
+                        configuration);
+        flinkDeployment
+                .getStatus()
+                .getJobStatus()
+                .getCheckpointInfo()
+                .setTrigger(triggerId, SnapshotTriggerType.MANUAL, CheckpointType.FULL);
         assertTrue(triggerCheckpointFuture.isDone());
         assertEquals(jobID, triggerCheckpointFuture.get());
     }
@@ -673,39 +754,31 @@ public class AbstractFlinkServiceTest {
         deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
         JobStatus jobStatus = deployment.getStatus().getJobStatus();
         jobStatus.setJobId(jobID.toHexString());
-        jobStatus.setState(org.apache.flink.api.common.JobStatus.RUNNING.name());
+        jobStatus.setState(RUNNING);
         ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
 
         jobStatus.setJobId(jobID.toString());
         deployment.getStatus().setJobStatus(jobStatus);
         flinkService.triggerSavepoint(
                 deployment.getStatus().getJobStatus().getJobId(),
-                SnapshotTriggerType.MANUAL,
-                deployment.getStatus().getJobStatus().getSavepointInfo(),
-                new Configuration(configuration)
-                        .set(OPERATOR_SAVEPOINT_FORMAT_TYPE, SavepointFormatType.NATIVE));
+                SavepointFormatType.NATIVE,
+                savepointPath,
+                new Configuration());
         assertTrue(triggerSavepointFuture.isDone());
         assertEquals(jobID, triggerSavepointFuture.get().f0);
         assertEquals(savepointPath, triggerSavepointFuture.get().f1);
         assertFalse(triggerSavepointFuture.get().f2);
         assertEquals(SavepointFormatType.NATIVE, triggerSavepointFuture.get().f3);
 
-        flinkService.cancelJob(
-                deployment,
-                UpgradeMode.SAVEPOINT,
+        var conf =
                 new Configuration(configManager.getObserveConfig(deployment))
-                        .set(OPERATOR_SAVEPOINT_FORMAT_TYPE, SavepointFormatType.NATIVE),
-                false);
+                        .set(OPERATOR_SAVEPOINT_FORMAT_TYPE, SavepointFormatType.NATIVE);
+        var result = flinkService.cancelJob(deployment, SuspendMode.SAVEPOINT, conf, false);
 
         assertTrue(stopWithSavepointFuture.isDone());
         assertEquals(
                 failAfterSavepointCompletes, stopWithSavepointFuture.isCompletedExceptionally());
-
-        var lastSavepoint =
-                deployment.getStatus().getJobStatus().getSavepointInfo().getLastSavepoint();
-        assertEquals(NATIVE, lastSavepoint.getFormatType());
-        assertEquals(savepointPath, lastSavepoint.getLocation());
-        assertEquals(jobID.toHexString(), deployment.getStatus().getJobStatus().getJobId());
+        assertEquals(savepointPath, result.getSavepointPath().get());
     }
 
     @Test
@@ -751,7 +824,7 @@ public class AbstractFlinkServiceTest {
         try {
             flinkService.getLastCheckpoint(new JobID(), new Configuration());
             fail();
-        } catch (RecoveryFailureException dpe) {
+        } catch (UpgradeFailureException dpe) {
 
         }
     }
@@ -830,7 +903,7 @@ public class AbstractFlinkServiceTest {
 
         response.set(AsynchronousOperationResult.completed(new CheckpointInfo(123L, null)));
         assertEquals(
-                CheckpointFetchResult.completed(),
+                CheckpointFetchResult.completed(123L),
                 flinkService.fetchCheckpointInfo(
                         triggerId.toString(), jobId.toString(), configuration));
 
@@ -945,63 +1018,6 @@ public class AbstractFlinkServiceTest {
     }
 
     @Test
-    public void effectiveStatusTest() {
-        JobDetails allRunning =
-                getJobDetails(
-                        org.apache.flink.api.common.JobStatus.RUNNING,
-                        Tuple2.of(ExecutionState.RUNNING, 4));
-        assertEquals(
-                org.apache.flink.api.common.JobStatus.RUNNING,
-                AbstractFlinkService.getEffectiveStatus(allRunning));
-
-        JobDetails allRunningOrFinished =
-                getJobDetails(
-                        org.apache.flink.api.common.JobStatus.RUNNING,
-                        Tuple2.of(ExecutionState.RUNNING, 2),
-                        Tuple2.of(ExecutionState.FINISHED, 2));
-        assertEquals(
-                org.apache.flink.api.common.JobStatus.RUNNING,
-                AbstractFlinkService.getEffectiveStatus(allRunningOrFinished));
-
-        JobDetails allRunningOrScheduled =
-                getJobDetails(
-                        org.apache.flink.api.common.JobStatus.RUNNING,
-                        Tuple2.of(ExecutionState.RUNNING, 2),
-                        Tuple2.of(ExecutionState.SCHEDULED, 2));
-        assertEquals(
-                org.apache.flink.api.common.JobStatus.CREATED,
-                AbstractFlinkService.getEffectiveStatus(allRunningOrScheduled));
-
-        JobDetails allFinished =
-                getJobDetails(
-                        org.apache.flink.api.common.JobStatus.FINISHED,
-                        Tuple2.of(ExecutionState.FINISHED, 4));
-        assertEquals(
-                org.apache.flink.api.common.JobStatus.FINISHED,
-                AbstractFlinkService.getEffectiveStatus(allFinished));
-    }
-
-    private JobDetails getJobDetails(
-            org.apache.flink.api.common.JobStatus status,
-            Tuple2<ExecutionState, Integer>... tasksPerState) {
-        int[] countPerState = new int[ExecutionState.values().length];
-        for (var taskPerState : tasksPerState) {
-            countPerState[taskPerState.f0.ordinal()] = taskPerState.f1;
-        }
-        int numTasks = Arrays.stream(countPerState).sum();
-        return new JobDetails(
-                new JobID(),
-                "test-job",
-                System.currentTimeMillis(),
-                -1,
-                0,
-                status,
-                System.currentTimeMillis(),
-                countPerState,
-                numTasks);
-    }
-
-    @Test
     public void isJobManagerReadyTest() throws Exception {
         AtomicReference<String> url = new AtomicReference<>();
         var clusterClient =
@@ -1046,11 +1062,167 @@ public class AbstractFlinkServiceTest {
                 });
     }
 
+    @Test
+    public void testBlockingDeploymentDeletion() {
+        String deploymentName = "test-cluster";
+        String namespace = "test-namespace";
+        String getUrl =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments?fieldSelector=metadata.name%%3D%s",
+                        namespace, deploymentName);
+        String watchUrl =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments?allowWatchBookmarks=true&fieldSelector=metadata.name%%3D%s&timeoutSeconds=600&watch=true",
+                        namespace, deploymentName);
+
+        var flinkService = new TestingService(null);
+
+        Deployment deployment =
+                new DeploymentBuilder()
+                        .withNewMetadata()
+                        .withName(deploymentName)
+                        .withNamespace(namespace)
+                        .endMetadata()
+                        .build();
+
+        DeploymentList deploymentList =
+                new DeploymentListBuilder()
+                        .withMetadata(new ListMeta())
+                        .withItems(deployment)
+                        .build();
+
+        mockServer
+                .expect()
+                .get()
+                .withPath(getUrl)
+                .andReturn(HttpURLConnection.HTTP_OK, deploymentList)
+                .always();
+
+        long deleteDelay = 1000;
+        mockServer
+                .expect()
+                .get()
+                .withPath(watchUrl)
+                .andUpgradeToWebSocket()
+                .open()
+                .waitFor(deleteDelay)
+                .andEmit(new WatchEvent(deployment, "DELETED"))
+                .done()
+                .always();
+
+        long start = System.currentTimeMillis();
+        long remainingMillis =
+                flinkService
+                        .deleteDeploymentBlocking(
+                                "Test",
+                                client.apps()
+                                        .deployments()
+                                        .inNamespace(namespace)
+                                        .withName(deploymentName),
+                                DeletionPropagation.BACKGROUND,
+                                Duration.ofMillis(10000))
+                        .toMillis();
+        long deleteTime = System.currentTimeMillis() - start;
+
+        // We make sure that delete waits until it gets the event
+        // This logic is not the best but seems to be good enough to capture the expectation
+        assertTrue(deleteTime > deleteDelay / 2);
+        assertEquals(3, mockServer.getRequestCount());
+        assertTrue(remainingMillis > 0);
+        assertTrue(remainingMillis < 10000 - deleteDelay / 2);
+
+        // Test actual timeout
+        remainingMillis =
+                flinkService
+                        .deleteDeploymentBlocking(
+                                "Test",
+                                client.apps()
+                                        .deployments()
+                                        .inNamespace(namespace)
+                                        .withName(deploymentName),
+                                DeletionPropagation.BACKGROUND,
+                                Duration.ofMillis(10))
+                        .toMillis();
+        assertEquals(0, remainingMillis);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {HttpURLConnection.HTTP_NOT_FOUND, HttpURLConnection.HTTP_BAD_REQUEST})
+    public void testBlockingDeletionWaitErrorHandling(int errorCode) {
+        int reqCount = mockServer.getRequestCount();
+        String deploymentName = "test-cluster";
+        String namespace = "test-namespace";
+        String getUrl =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments?fieldSelector=metadata.name%%3D%s",
+                        namespace, deploymentName);
+
+        // Throw error when we try to wait for deletion
+        mockServer
+                .expect()
+                .get()
+                .withPath(getUrl)
+                .andReply(
+                        errorCode,
+                        recordedRequest -> {
+                            // Send error after a short delay
+                            try {
+                                Thread.sleep(10);
+                            } catch (Exception e) {
+                            }
+                            return null;
+                        })
+                .always();
+
+        var remaining =
+                AbstractFlinkService.deleteBlocking(
+                        "Test",
+                        () ->
+                                client.apps()
+                                        .deployments()
+                                        .inNamespace(namespace)
+                                        .withName(deploymentName),
+                        Duration.ofMillis(1000));
+
+        assertEquals(1, mockServer.getRequestCount() - reqCount);
+        assertTrue(remaining.toMillis() < 1000);
+    }
+
+    @Test
+    public void testBlockingDeletionDeleteCallErrorHandling() {
+        // Non not-found errors should be thrown
+        Assertions.assertThrows(
+                KubernetesClientException.class,
+                () ->
+                        AbstractFlinkService.deleteBlocking(
+                                "Test",
+                                () -> {
+                                    throw new KubernetesClientException(
+                                            null, HttpURLConnection.HTTP_BAD_REQUEST, null);
+                                },
+                                Duration.ofMillis(1000)));
+
+        // Not found errors should be ignored
+        var remaining =
+                AbstractFlinkService.deleteBlocking(
+                        "Test",
+                        () -> {
+                            Thread.sleep(10);
+                            throw new KubernetesClientException(
+                                    null, HttpURLConnection.HTTP_NOT_FOUND, null);
+                        },
+                        Duration.ofMillis(1000));
+
+        assertTrue(remaining.toMillis() > 0);
+        assertTrue(remaining.toMillis() < 1000);
+    }
+
     class TestingService extends AbstractFlinkService {
 
         RestClusterClient<String> clusterClient;
         RestClient restClient;
-        List<ObjectMeta> deleted = new ArrayList<>();
+        List<Tuple2<String, String>> deleted = new ArrayList<>();
+        List<Tuple2<String, String>> haDeleted = new ArrayList<>();
 
         Map<Tuple2<String, String>, PodList> jmPods = new HashMap<>();
         Map<Tuple2<String, String>, PodList> tmPods = new HashMap<>();
@@ -1085,11 +1257,6 @@ public class AbstractFlinkServiceTest {
         }
 
         @Override
-        protected PodList getTmPodList(String namespace, String clusterId) {
-            return tmPods.getOrDefault(Tuple2.of(namespace, clusterId), new PodList());
-        }
-
-        @Override
         protected void deployApplicationCluster(JobSpec jobSpec, Configuration conf) {
             throw new UnsupportedOperationException();
         }
@@ -1100,28 +1267,28 @@ public class AbstractFlinkServiceTest {
         }
 
         @Override
-        public void cancelJob(
-                FlinkDeployment deployment, UpgradeMode upgradeMode, Configuration conf) {
+        public CancelResult cancelJob(
+                FlinkDeployment deployment, SuspendMode upgradeMode, Configuration conf) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public ScalingResult scale(FlinkResourceContext<?> resourceContext, Configuration conf) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean scalingCompleted(FlinkResourceContext<?> resourceContext) {
+        public boolean scale(FlinkResourceContext<?> resourceContext, Configuration conf) {
             throw new UnsupportedOperationException();
         }
 
         @Override
         protected void deleteClusterInternal(
-                ObjectMeta meta,
+                String namespace,
+                String clusterId,
                 Configuration conf,
-                boolean deleteHaData,
                 DeletionPropagation deletionPropagation) {
-            deleted.add(meta);
+            deleted.add(Tuple2.of(namespace, clusterId));
+        }
+
+        @Override
+        protected void deleteHAData(String namespace, String clusterId, Configuration conf) {
+            haDeleted.add(Tuple2.of(namespace, clusterId));
         }
     }
 }

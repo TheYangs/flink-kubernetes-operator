@@ -36,15 +36,6 @@ public enum ScalingMetric {
     /** Observed true processing rate for sources. */
     OBSERVED_TPR(true),
 
-    /** Current processing rate. */
-    CURRENT_PROCESSING_RATE(true),
-
-    /**
-     * Incoming data rate to the source, e.g. rate of records written to the Kafka topic
-     * (records/sec).
-     */
-    SOURCE_DATA_RATE(true),
-
     /** Target processing rate of operators as derived from source inputs (records/sec). */
     TARGET_DATA_RATE(true),
 
@@ -62,6 +53,10 @@ public enum ScalingMetric {
 
     /** Job vertex max parallelism. */
     MAX_PARALLELISM(false),
+
+    /** Source vertex partition count. */
+    NUM_SOURCE_PARTITIONS(false),
+
     /** Upper boundary of the target data rate range. */
     SCALE_UP_RATE_THRESHOLD(false),
 
@@ -71,14 +66,29 @@ public enum ScalingMetric {
     /** Expected true processing rate after scale up. */
     EXPECTED_PROCESSING_RATE(false),
 
+    NUM_RECORDS_IN(false),
+
+    NUM_RECORDS_OUT(false),
+
+    ACCUMULATED_BUSY_TIME(false),
+
     /**
      * Maximum GC pressure across taskmanagers. Percentage of time spent garbage collecting between
      * 0 (no time in GC) and 1 (100% time in GC).
      */
     GC_PRESSURE(false),
 
+    /** Measured max used heap size in bytes. */
+    HEAP_MEMORY_USED(true),
+
+    /** Measured max managed memory size in bytes. */
+    MANAGED_MEMORY_USED(true),
+
+    /** Measured max metaspace memory size in bytes. */
+    METASPACE_MEMORY_USED(true),
+
     /** Percentage of max heap used (between 0 and 1). */
-    HEAP_USAGE(true),
+    HEAP_MAX_USAGE_RATIO(true),
 
     NUM_TASK_SLOTS_USED(false);
 
@@ -95,6 +105,7 @@ public enum ScalingMetric {
                     PARALLELISM,
                     RECOMMENDED_PARALLELISM,
                     MAX_PARALLELISM,
+                    NUM_SOURCE_PARTITIONS,
                     SCALE_UP_RATE_THRESHOLD,
                     SCALE_DOWN_RATE_THRESHOLD,
                     EXPECTED_PROCESSING_RATE);

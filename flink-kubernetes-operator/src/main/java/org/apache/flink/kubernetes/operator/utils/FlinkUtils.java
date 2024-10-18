@@ -41,8 +41,8 @@ import io.fabric8.kubernetes.api.model.ConfigMapList;
 import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.HTTPGetAction;
 import io.fabric8.kubernetes.api.model.IntOrString;
-import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodSpec;
+import io.fabric8.kubernetes.api.model.PodTemplateSpec;
 import io.fabric8.kubernetes.api.model.Probe;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
 import io.fabric8.kubernetes.api.model.apps.DeploymentCondition;
@@ -58,6 +58,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Predicate;
 
 import static org.apache.flink.kubernetes.utils.Constants.LABEL_CONFIGMAP_TYPE_HIGH_AVAILABILITY;
 
@@ -69,7 +70,8 @@ public class FlinkUtils {
 
     public static final String CR_GENERATION_LABEL = "flinkdeployment.flink.apache.org/generation";
 
-    public static Pod mergePodTemplates(Pod toPod, Pod fromPod, boolean mergeArraysByName) {
+    public static PodTemplateSpec mergePodTemplates(
+            PodTemplateSpec toPod, PodTemplateSpec fromPod, boolean mergeArraysByName) {
         if (fromPod == null) {
             return ReconciliationUtils.clone(toPod);
         } else if (toPod == null) {
@@ -79,7 +81,7 @@ public class FlinkUtils {
         JsonNode node2 = MAPPER.valueToTree(fromPod);
         mergeInto(node1, node2, mergeArraysByName);
         try {
-            return MAPPER.treeToValue(node1, Pod.class);
+            return MAPPER.treeToValue(node1, PodTemplateSpec.class);
         } catch (Exception ex) {
             throw new RuntimeException(ex);
         }
@@ -152,7 +154,7 @@ public class FlinkUtils {
         return out;
     }
 
-    public static void addStartupProbe(Pod pod) {
+    public static void addStartupProbe(PodTemplateSpec pod) {
         var spec = pod.getSpec();
         if (spec == null) {
             spec = new PodSpec();
@@ -286,6 +288,20 @@ public class FlinkUtils {
 
     public static boolean isKubernetesHaMetadataAvailable(
             Configuration conf, KubernetesClient kubernetesClient) {
+        return isKubernetesHaMetadataAvailable(
+                conf, kubernetesClient, FlinkUtils::isValidHaConfigMap);
+    }
+
+    public static boolean isKubernetesHaMetadataAvailableWithCheckpoint(
+            Configuration conf, KubernetesClient kubernetesClient) {
+        return isKubernetesHaMetadataAvailable(
+                conf, kubernetesClient, cm -> isValidHaConfigMap(cm) && checkpointExists(cm));
+    }
+
+    private static boolean isKubernetesHaMetadataAvailable(
+            Configuration conf,
+            KubernetesClient kubernetesClient,
+            Predicate<ConfigMap> cmPredicate) {
 
         String clusterId = conf.get(KubernetesConfigOptions.CLUSTER_ID);
         String namespace = conf.get(KubernetesConfigOptions.NAMESPACE);
@@ -302,7 +318,7 @@ public class FlinkUtils {
                         .list()
                         .getItems();
 
-        return configMaps.stream().anyMatch(FlinkUtils::isValidHaConfigMap);
+        return configMaps.stream().anyMatch(cmPredicate);
     }
 
     private static boolean isValidHaConfigMap(ConfigMap cm) {
@@ -316,6 +332,13 @@ public class FlinkUtils {
         }
 
         return name.endsWith("-jobmanager-leader");
+    }
+
+    private static boolean checkpointExists(ConfigMap cm) {
+        var data = cm.getData();
+        return data != null
+                && data.keySet().stream()
+                        .anyMatch(s -> s.startsWith(Constants.CHECKPOINT_ID_KEY_PREFIX));
     }
 
     private static boolean isJobGraphKey(Map.Entry<String, String> entry) {
